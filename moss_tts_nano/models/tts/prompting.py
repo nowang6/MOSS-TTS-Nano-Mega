@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import List, Sequence
 
-from .configuration_moss_tts_nano import MossTTSNanoConfig
+from .configuration import MossTTSNanoConfig
 
 
 # ---------------------------------------------------------------------------

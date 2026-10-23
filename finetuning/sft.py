@@ -44,11 +44,18 @@ SCHEDULER_CHOICES = (
 
 MODEL_SUPPORT_FILES = (
     "__init__.py",
-    "configuration_moss_tts_nano.py",
+    "audio_codec.py",
+    "configuration.py",
+    "constants.py",
+    "generation.py",
     "gpt2_decoder.py",
-    "modeling_moss_tts_nano.py",
+    "inference_api.py",
+    "inference_inputs.py",
+    "modeling.py",
     "prompting.py",
-    "tokenization_moss_tts_nano.py",
+    "text_chunking.py",
+    "tokenization.py",
+    "tokenizer_loading.py",
 )
 
 
@@ -301,14 +308,14 @@ def compute_supervised_loss(
 
 
 CHECKPOINT_AUTO_MAP = {
-    "AutoConfig": "configuration_moss_tts_nano.MossTTSNanoConfig",
-    "AutoModel": "modeling_moss_tts_nano.MossTTSNanoForCausalLM",
-    "AutoModelForCausalLM": "modeling_moss_tts_nano.MossTTSNanoForCausalLM",
+    "AutoConfig": "configuration.MossTTSNanoConfig",
+    "AutoModel": "modeling.MossTTSNanoForCausalLM",
+    "AutoModelForCausalLM": "modeling.MossTTSNanoForCausalLM",
 }
 
 CHECKPOINT_TOKENIZER_AUTO_MAP = {
     "AutoTokenizer": [
-        "tokenization_moss_tts_nano.MossTTSNanoSentencePieceTokenizer",
+        "tokenization.MossTTSNanoSentencePieceTokenizer",
         None,
     ]
 }

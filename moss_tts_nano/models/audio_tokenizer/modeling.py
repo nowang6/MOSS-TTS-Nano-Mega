@@ -68,9 +68,16 @@ try:
 except ImportError:
     _hf_auto_docstring = None
 
+
+def _hf_auto_docstring_usable() -> bool:
+    """transformers 的 auto_docstring 依据 modeling_<model_type>.py 文件名推导模型类型；
+    本文件名不符合该约定时委托只会打印 🚨 警告且拿不到占位符文档，视为不可用。"""
+    return _hf_auto_docstring is not None and Path(__file__).name.startswith("modeling_")
+
+
 def auto_docstring(*args, **kwargs):
-    """transformers.auto_docstring 的兼容包装：老版本没有该 API 时退化为无操作。"""
-    if _hf_auto_docstring is None:
+    """transformers.auto_docstring 的兼容包装：API 缺失或文件名不符合其推导约定时退化为无操作。"""
+    if not _hf_auto_docstring_usable():
         if len(args) == 1 and callable(args[0]) and not kwargs:
             return args[0]
 
@@ -103,12 +110,12 @@ def auto_docstring(*args, **kwargs):
     return safe_decorator
 
 try:
-    from .configuration_moss_audio_tokenizer import MossAudioTokenizerConfig
+    from .configuration import MossAudioTokenizerConfig
 except ImportError:
     _module_dir = str(Path(__file__).resolve().parent)
     if _module_dir not in sys.path:
         sys.path.insert(0, _module_dir)
-    from configuration_moss_audio_tokenizer import MossAudioTokenizerConfig
+    from configuration import MossAudioTokenizerConfig
 
 
 logger = logging.get_logger(__name__)

@@ -1,10 +1,10 @@
-from .configuration_moss_tts_nano import MossTTSNanoConfig
-from .modeling_moss_tts_nano import (
+from .configuration import MossTTSNanoConfig
+from .modeling import (
     MossTTSNanoForCausalLM,
     MossTTSNanoGenerationOutput,
     MossTTSNanoOutput,
 )
-from .tokenization_moss_tts_nano import MossTTSNanoSentencePieceTokenizer
+from .tokenization import MossTTSNanoSentencePieceTokenizer
 
 try:
     MossTTSNanoConfig.register_for_auto_class()

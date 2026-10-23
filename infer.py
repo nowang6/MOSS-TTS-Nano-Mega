@@ -50,7 +50,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
 
     text_group = parser.add_mutually_exclusive_group(required=False)
-    text_group.add_argument("--text", help="Text to synthesize.", default="已是悬崖百丈冰，犹有花枝俏。")
+    text_group.add_argument("--text", help="Text to synthesize.", default="你好，欢迎使用语音合成系统。")
     text_group.add_argument("--text-file", help="Path to a UTF-8 text file to synthesize.")
 
     prompt_text_group = parser.add_mutually_exclusive_group(required=False)

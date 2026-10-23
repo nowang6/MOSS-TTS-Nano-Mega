@@ -593,7 +593,6 @@ class MossTTSNanoGPT2Model(nn.Module):
         num_sequences: Optional[torch.Tensor] = None,
     ) -> BaseModelOutputWithPast:
         del input_ids, output_attentions
-
         if inputs_embeds is None:
             raise ValueError("inputs_embeds must be provided.")
 
