@@ -83,7 +83,7 @@ class MossAudioTokenizerConfig(PreTrainedConfig):
 
     model_type = "moss-audio-tokenizer"
 
-    # Backward-compatible alias used by some checkpoints.
+    # 兼容旧 checkpoint 的别名：sample_rate 会被映射到 sampling_rate
     attribute_map = {"sample_rate": "sampling_rate"}
 
     sampling_rate: int
@@ -114,9 +114,10 @@ class MossAudioTokenizerConfig(PreTrainedConfig):
         quantizer_kwargs: dict[str, Any] | None = None,
         **kwargs,
     ):
-        # Some checkpoints might include an incorrect/legacy `model_type` (e.g. "speech_tokenizer").
-        # We drop it to avoid overriding the class-level `model_type`.
+        # 一些 checkpoint 可能带有错误/历史的 model_type（如 "speech_tokenizer"），
+        # 丢弃它以免覆盖类级别的 model_type。
         kwargs.pop("model_type", None)
+        # 以下若干分支是旧 checkpoint 的字段名兼容
         if "channels_numbers" in kwargs:
             number_channels = kwargs.pop("channels_numbers")
         if "enable_channel_interleave" in kwargs:
@@ -127,7 +128,7 @@ class MossAudioTokenizerConfig(PreTrainedConfig):
             compute_dtype = kwargs.pop("codec_compute_dtype")
         reversed_decoder_kwargs = kwargs.pop("reversed_decoder_kwargs", None)
 
-        # `version` is accepted for compatibility but not used in modeling.
+        # `version` 仅为兼容而保留，建模时未使用
         self.version = version
         self.sampling_rate = sampling_rate
         self.downsample_rate = downsample_rate
@@ -136,7 +137,10 @@ class MossAudioTokenizerConfig(PreTrainedConfig):
         self.enable_channel_interleave = enable_channel_interleave
         self.attention_implementation = attention_implementation
         self.compute_dtype = compute_dtype
-        # Default encoder configuration
+
+        # 默认编码器配置：交替堆叠 PatchedPretransform（下采样）与 causal Transformer。
+        # 帧率变化链：240 -> 2 -> 2 -> 2 -> 2，即 48000Hz 波形最终降到 12.5Hz 帧率
+        # （总下采样率 3840 = 240 * 2 * 2 * 2 * 2）。
         if encoder_kwargs is None:
             encoder_kwargs = [
                 {
@@ -268,12 +272,15 @@ class MossAudioTokenizerConfig(PreTrainedConfig):
             ]
         else:
             encoder_kwargs = [dict(module_kwargs) for module_kwargs in encoder_kwargs]
+        # 未单独指定 context_duration 的 Transformer 使用全局兜底值
         for module_kwargs in encoder_kwargs:
             if module_kwargs.get("module_type") == "Transformer":
                 module_kwargs.setdefault("context_duration", causal_transformer_context_duration)
         self.encoder_kwargs = encoder_kwargs
 
-        # Default decoder configuration (execution order)
+        # 解码器配置（按执行顺序）。
+        # 兼容旧格式：reversed_decoder_kwargs 是与编码器同序（逆执行序）的写法，
+        # 需要反转列表并交换每个 Transformer 的输入/输出维度。
         if decoder_kwargs is None and reversed_decoder_kwargs is not None:
             reversed_decoder_kwargs = [dict(module_kwargs) for module_kwargs in reversed_decoder_kwargs]
             decoder_kwargs = []
@@ -288,6 +295,7 @@ class MossAudioTokenizerConfig(PreTrainedConfig):
                 )
                 decoder_kwargs.append(module_kwargs)
 
+        # 默认解码器配置：与编码器镜像，逐级上采样回 48000Hz 波形
         if decoder_kwargs is None:
             decoder_kwargs = [
                 {
@@ -424,7 +432,7 @@ class MossAudioTokenizerConfig(PreTrainedConfig):
                 module_kwargs.setdefault("context_duration", causal_transformer_context_duration)
         self.decoder_kwargs = decoder_kwargs
 
-        # Default quantizer configuration
+        # 默认量化器配置：RLFQ，32 层码本，每层 1024 个码字、维度 8
         if quantizer_kwargs is None:
             quantizer_kwargs = {
                 "input_dim": 768,
@@ -436,7 +444,7 @@ class MossAudioTokenizerConfig(PreTrainedConfig):
                 "quantizer_type": "rlfq",
             }
 
-        # Handle quantizer_type from kwargs or config
+        # quantizer_type 以 quantizer_kwargs 内嵌值优先，否则用顶层参数并回写
         kw_qtype = quantizer_kwargs.get("quantizer_type", None)
         if kw_qtype is not None:
             self.quantizer_type = kw_qtype

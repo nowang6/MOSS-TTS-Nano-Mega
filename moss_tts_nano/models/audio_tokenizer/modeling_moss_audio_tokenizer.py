@@ -11,7 +11,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""PyTorch MossAudioTokenizer model."""
+"""PyTorch MossAudioTokenizer model.
+
+MOSS 音频编解码器（neural audio codec）：把波形压缩成离散 token，再还原回波形。
+
+整体数据流：
+    波形 [B, C, T]
+      -> 编码器（PatchedPretransform 下采样 + causal Transformer 交替堆叠）
+      -> 残差量化器（RVQ / RLFQ，逐层量化残差，得到 n_quantizers 层码本 token）
+      -> 解码器（与编码器镜像，逐级上采样）
+      -> 重建波形 [B, C, T]
+
+本文件同时支持三种使用方式：
+1. 整段离线编解码（encode / decode / batch_encode / batch_decode）；
+2. 分块流式编解码（chunk_duration + streaming，内部维护 KV cache）；
+3. 连续批处理流式解码（MossAudioTokenizerDecodeSession，可选 CUDA Graph 加速）。
+"""
 
 from __future__ import annotations
 
@@ -30,12 +45,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# 把本模块注册成一个可动态更新的代理模块：
+# 这样 checkpoint 以 trust_remote_code 方式加载本文件时，
+# 之后定义/更新的类都能通过 sys.modules 访问到（ pickle 反序列化依赖这一点）。
 if __name__ not in sys.modules:
     _module_proxy = types.ModuleType(__name__)
     sys.modules[__name__] = _module_proxy
 
 
 def _sync_module_proxy() -> None:
+    """把当前模块的最新全局符号同步进代理模块。"""
     sys.modules[__name__].__dict__.update(globals())
 
 try:
@@ -50,6 +69,7 @@ except ImportError:
     _hf_auto_docstring = None
 
 def auto_docstring(*args, **kwargs):
+    """transformers.auto_docstring 的兼容包装：老版本没有该 API 时退化为无操作。"""
     if _hf_auto_docstring is None:
         if len(args) == 1 and callable(args[0]) and not kwargs:
             return args[0]
@@ -96,6 +116,7 @@ logger = logging.get_logger(__name__)
 
 @lru_cache(maxsize=1)
 def _get_flash_attn_module():
+    """尝试导入 flash_attn；未安装时返回 None（结果缓存，避免重复导入）。"""
     try:
         return importlib.import_module("flash_attn")
     except Exception:
@@ -121,9 +142,11 @@ def _get_flash_attn_with_kvcache():
 
 
 SUPPORTED_ATTENTION_IMPLEMENTATIONS = {"sdpa", "flash_attention_2"}
+# compute_dtype 名称 -> torch dtype；fp32 用 None 表示“不做 autocast”
 SUPPORTED_COMPUTE_DTYPES = {"fp32": None, "bf16": torch.bfloat16, "fp16": torch.float16}
 
 
+# 解码会话（DecodeSession）相关的错误信息，集中定义便于统一维护
 _ACTIVE_DECODE_SESSION_ERROR_MESSAGE = "MossAudioTokenizerModel only supports one active decode session at a time."
 _CLOSED_DECODE_SESSION_ERROR_MESSAGE = "This decode session is closed."
 _MODEL_STREAMING_CONFLICT_ERROR_MESSAGE = "Model-level streaming helpers cannot be used while a decode session is active."
@@ -144,6 +167,7 @@ _BATCH_DECODE_STREAMING_SHRINK_ERROR_MESSAGE = (
 
 
 def resolve_compute_dtype(compute_dtype: str) -> torch.dtype | None:
+    """把配置里的 compute_dtype 名称解析为 torch.dtype（fp32 返回 None）。"""
     if compute_dtype not in SUPPORTED_COMPUTE_DTYPES:
         raise ValueError(
             f"Unsupported compute_dtype={compute_dtype!r}. Expected one of {sorted(SUPPORTED_COMPUTE_DTYPES)}."
@@ -153,6 +177,7 @@ def resolve_compute_dtype(compute_dtype: str) -> torch.dtype | None:
 
 @contextmanager
 def disable_cuda_autocast():
+    """临时关闭 CUDA autocast（量化器内部强制用 fp32 计算，保证数值稳定）。"""
     with torch.autocast(device_type="cuda", enabled=False):
         yield
 
@@ -224,7 +249,12 @@ class MossAudioTokenizerOutput(ModelOutput):
 _sync_module_proxy()
 @dataclass
 class StreamingState:
-    """Base state for streaming modules."""
+    """Base state for streaming modules.
+
+    流式推理时，每个 StreamingModule 挂一个这样的状态对象。
+    ``exec_mask`` 标记 batch 中哪些样本在当前步真的参与计算
+    （连续批处理中，已结束的样本对应位置为 False）。
+    """
 
     batch_size: int
     device: torch.device
@@ -236,10 +266,11 @@ class StreamingState:
         self.exec_mask[:] = exec_mask
 
     def reset(self, reset_mask: torch.Tensor) -> None:
+        """把 reset_mask 为 True 的样本的执行掩码重置为 True（子类会顺带清空缓存）。"""
         self.exec_mask[:] = torch.where(reset_mask, torch.ones_like(self.exec_mask), self.exec_mask)
 
     def __enter__(self):
-        # ExitStack expects a context manager; returning self is conventional and useful for debugging.
+        # ExitStack 要求上下文管理器；返回 self 是惯例，也便于调试
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
@@ -247,11 +278,16 @@ class StreamingState:
 
 
 class StreamingModule(nn.Module):
-    """Base class for streaming components."""
+    """Base class for streaming components.
+
+    提供 ``streaming(batch_size)`` 上下文管理器：进入时为整棵子模块树
+    初始化流式状态，退出时统一清除。
+    """
 
     def __init__(self) -> None:
         super().__init__()
         self._streaming_state: StreamingState | None = None
+        # detached 标记：被「借用」到别处的子模块不参与宿主模块的流式遍历
         self._streaming_detached: bool = False
         self._cached_children: list[tuple[str, StreamingModule]] | None = None
 
@@ -260,6 +296,11 @@ class StreamingModule(nn.Module):
         return self._streaming_state is not None
 
     def _apply_named_streaming(self, fn):
+        """对整棵子模块树中的每个 StreamingModule 调用 fn(name, module)。
+
+        首次调用时自根向下遍历并缓存子模块列表，之后复用缓存。
+        """
+
         def _handle_module(prefix: str, module: nn.Module):
             if isinstance(module, StreamingModule):
                 if module._streaming_detached and prefix != "":
@@ -278,6 +319,8 @@ class StreamingModule(nn.Module):
             fn(name, child)
 
     def _start_streaming(self, batch_size: int, exit_stack: ExitStack):
+        """为所有流式子模块初始化状态，并注册到 exit_stack 统一清理。"""
+
         def _start_streaming_fn(name: str, module: StreamingModule):
             if module._streaming_state is not None:
                 raise RuntimeError(f"{name} is already streaming!")
@@ -312,6 +355,17 @@ class StreamingContainer(StreamingModule):
 
 
 class MossAudioTokenizerDecodeSession:
+    """连续批处理（continuous batching）流式解码会话。
+
+    会话内部维护一个固定大小（max_batch_size）的物理槽位池：
+    - ``append(request_id)``：新请求占用一个空闲槽位；
+    - ``step(request_ids, codes, code_lengths)``：把逻辑 batch 的码本帧
+      打包进物理槽位，逐帧调用解码器，再把结果按逻辑顺序返回；
+    - ``remove(request_id)``：请求结束后释放槽位并重置其流式状态。
+
+    物理槽位与逻辑请求解耦，使得不同请求可以随时随地加入/退出，
+    而解码器内部的流式 KV cache 始终按物理槽位对齐。
+    """
     model: MossAudioTokenizerModel
     max_batch_size: int
     _use_cuda_graph: bool
@@ -336,6 +390,7 @@ class MossAudioTokenizerDecodeSession:
         if max_batch_size <= 0:
             raise ValueError("`max_batch_size` must be > 0.")
 
+        # 收集解码器中所有注意力模块；连续批处理要求它们都有有限的 context 窗口
         decoder_attention_modules: list[MossAudioTokenizerMultiheadAttention] = []
         for decoder_module in model.decoder:
             for module in decoder_module.modules():
@@ -347,12 +402,14 @@ class MossAudioTokenizerDecodeSession:
                         )
                     decoder_attention_modules.append(module)
 
+        # CUDA Graph 模式：注意力切换到 flash kvcache 内核，保证图捕获时形状固定
         flash_kvcache_attention_modules: list[MossAudioTokenizerMultiheadAttention] = []
         if use_cuda_graph and _has_flash_attn():
             for module in decoder_attention_modules:
                 module._use_flash_kvcache = True
                 flash_kvcache_attention_modules.append(module)
 
+        # 为解码器中的所有流式模块初始化状态；失败时回滚
         decode_streaming_exit_stack = ExitStack()
         try:
             for decoder_module in model.decoder:
@@ -395,6 +452,7 @@ class MossAudioTokenizerDecodeSession:
             raise RuntimeError(_CLOSED_DECODE_SESSION_ERROR_MESSAGE)
 
     def append(self, request_id: str | int) -> None:
+        """注册一个新解码请求，分配一个空闲物理槽位。"""
         self._ensure_open()
 
         if request_id in self.request_id_to_slot_index:
@@ -412,6 +470,7 @@ class MossAudioTokenizerDecodeSession:
         self.request_id_to_audio_offset[request_id] = 0
 
     def _decoder_streaming_states(self) -> list[StreamingState]:
+        """收集解码器中所有已激活的流式状态。"""
         decoder_streaming_states: list[StreamingState] = []
         for decoder_module in self.model.decoder:
             for module in decoder_module.modules():
@@ -420,6 +479,7 @@ class MossAudioTokenizerDecodeSession:
         return decoder_streaming_states
 
     def _ensure_cuda_graph_buffers(self, device: torch.device) -> None:
+        """准备 CUDA Graph 所需的固定形状输入/输出缓冲区。"""
         if not self._use_cuda_graph or device.type != "cuda":
             return
         graph_num_quantizers_capacity = self._graph_num_quantizers_capacity
@@ -429,6 +489,7 @@ class MossAudioTokenizerDecodeSession:
         if graph_num_quantizers_capacity <= 0:
             raise RuntimeError("`use_cuda_graph=True` requires a quantizer with `num_quantizers > 0`.")
         if self._graph_input_codes is None or self._graph_input_codes.device != device:
+            # CUDA Graph 要求输入张量地址固定，因此预分配最大形状的缓冲区反复写入
             self._graph_input_codes = torch.zeros(
                 (graph_num_quantizers_capacity, self.max_batch_size, 1),
                 device=device,
@@ -441,6 +502,7 @@ class MossAudioTokenizerDecodeSession:
             self._cuda_graph_key = None
 
     def _snapshot_decoder_streaming_states(self) -> list[tuple[StreamingState, dict[str, torch.Tensor | None]]]:
+        """快照所有流式状态（CUDA Graph 预热会污染状态，捕获前需要保存、之后恢复）。"""
         snapshots: list[tuple[StreamingState, dict[str, torch.Tensor | None]]] = []
         for streaming_state in self._decoder_streaming_states():
             state_snapshot: dict[str, torch.Tensor | None] = {"exec_mask": streaming_state.exec_mask.clone()}
@@ -530,6 +592,11 @@ class MossAudioTokenizerDecodeSession:
         codes: torch.Tensor,
         code_lengths: torch.Tensor,
     ) -> MossAudioTokenizerDecoderOutput:
+        """用 CUDA Graph 解码一帧。
+
+        首次（或关键形状变化时）先预热再捕获计算图；之后直接 replay。
+        预热在独立 stream 上进行，并先快照、后恢复流式状态，避免污染。
+        """
         self._ensure_cuda_graph_buffers(codes.device)
         graph_input_codes = self._graph_input_codes
         graph_input_code_lengths = self._graph_input_code_lengths
@@ -569,6 +636,7 @@ class MossAudioTokenizerDecodeSession:
         )
 
     def _reset_slot(self, slot_index: int) -> None:
+        """重置某个物理槽位的全部流式状态（请求结束后释放槽位时调用）。"""
         for streaming_state in self._decoder_streaming_states():
             reset_mask = torch.zeros(streaming_state.batch_size, dtype=torch.bool, device=streaming_state.exec_mask.device)
             reset_mask[slot_index] = True
@@ -580,6 +648,12 @@ class MossAudioTokenizerDecodeSession:
         codes: torch.Tensor,
         code_lengths: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, list[int], torch.Tensor]:
+        """把逻辑 batch 的码本帧写入对应的物理槽位。
+
+        逻辑 batch 中第 i 行属于 request_ids[i]，其实际数据要放到
+        该请求占用的物理槽位上；空闲槽位补零。返回打包后的张量、
+        各槽位长度、逻辑行 -> 物理槽位映射以及原始逻辑长度。
+        """
         if request_ids != self.active_request_ids:
             raise ValueError(_INVALID_DECODE_STEP_REQUEST_IDS_ERROR_MESSAGE)
 
@@ -629,6 +703,7 @@ class MossAudioTokenizerDecodeSession:
         code_lengths: torch.Tensor,
         audio_lengths: torch.Tensor,
     ) -> None:
+        """累加每个请求已消费的码本帧数与已产出的波形采样点数。"""
         for logical_row_index, request_id in enumerate(request_ids):
             self.request_id_to_code_offset[request_id] += int(code_lengths[logical_row_index].item())
             self.request_id_to_audio_offset[request_id] += int(audio_lengths[logical_row_index].item())
@@ -639,6 +714,11 @@ class MossAudioTokenizerDecodeSession:
         codes: torch.Tensor,
         code_lengths: torch.Tensor,
     ) -> tuple[list[str | int], torch.Tensor, torch.Tensor]:
+        """推进一步解码：逐帧跑解码器，把物理槽位的结果还原成逻辑 batch。
+
+        返回 (request_ids, audio [B, C, T], audio_lengths [B])，
+        顺序与传入的 request_ids 一致。
+        """
         self._ensure_open()
 
         packed_codes, packed_code_lengths, logical_row_to_slot_index, logical_code_lengths = (
@@ -654,12 +734,14 @@ class MossAudioTokenizerDecodeSession:
             raise ValueError("`step()` requires at least one row with `code_length > 0`.")
 
         decoder_streaming_states = self._decoder_streaming_states()
+        # 每个逻辑行本次解码出的波形片段（按帧追加，最后拼接）
         logical_audio_chunks: list[list[torch.Tensor]] = [[] for _ in request_ids]
         audio_device: torch.device | None = None
         audio_dtype: torch.dtype | None = None
         audio_num_channels: int | None = None
 
         try:
+            # 逐帧解码：每一帧只让「该帧仍有有效码本」的槽位参与计算
             for frame_index in range(max_step_length):
                 frame_exec_mask = packed_code_lengths > frame_index
                 for streaming_state in decoder_streaming_states:
@@ -681,6 +763,7 @@ class MossAudioTokenizerDecodeSession:
                 audio_dtype = audio.dtype
                 audio_num_channels = audio.shape[1]
 
+                # 把物理槽位的输出按映射写回逻辑行
                 for logical_row_index, slot_index in enumerate(logical_row_to_slot_index):
                     audio_length = int(audio_lengths[slot_index].item())
                     if audio_length <= 0:
@@ -690,6 +773,7 @@ class MossAudioTokenizerDecodeSession:
             self.close()
             raise
         finally:
+            # 恢复全量执行掩码，避免影响下一次 step
             for streaming_state in decoder_streaming_states:
                 streaming_state.set_exec_mask(torch.ones_like(streaming_state.exec_mask))
 
@@ -774,7 +858,11 @@ class MossAudioTokenizerDecodeSession:
 
 
 class MossAudioTokenizerRMSNorm(nn.Module):
-    """Root Mean Square Layer Normalization."""
+    """Root Mean Square Layer Normalization.
+
+    对最后一维做 RMS 归一化：y = x * alpha / sqrt(mean(x^2) + eps)。
+    ``alpha`` 初始为 1，是可学习的逐通道增益（checkpoint 键名，勿改）。
+    """
 
     def __init__(
         self,
@@ -789,19 +877,24 @@ class MossAudioTokenizerRMSNorm(nn.Module):
         self.alpha = nn.Parameter(torch.full((1, 1, dim), 1.0, requires_grad=True, device=device, dtype=dtype))
 
     def forward(self, x: torch.Tensor):
-        x_dtype = x.dtype
+        input_dtype = x.dtype
         if self.dtype is not None:
             x = x.to(self.dtype)
-        var = self.eps + torch.mean(x**2, dim=-1, keepdim=True)
-        alpha = self.alpha.to(var)
+        variance = self.eps + torch.mean(x**2, dim=-1, keepdim=True)
+        alpha = self.alpha.to(variance)
         if x.dim() == 2:
+            # [N, D] 输入时把 (1, 1, D) 的增益压成 (1, D)
             alpha = alpha.view(1, -1)
-        y = (x * (alpha * torch.rsqrt(var))).to(x_dtype)
-        return y
+        output = (x * (alpha * torch.rsqrt(variance))).to(input_dtype)
+        return output
 
 
 class MossAudioTokenizerLayerScale(nn.Module):
-    """Layer scale from Touvron et al. 2021."""
+    """Layer scale from Touvron et al. 2021.
+
+    每个通道乘一个小的可学习缩放系数（初始值通常 1e-4 ~ 0.01），
+    稳定深层网络的训练；推理时就是一个逐通道乘法。
+    """
 
     def __init__(
         self,
@@ -829,6 +922,7 @@ def create_norm_fn(norm_type: str, dim: int, **kwargs) -> nn.Module:
     elif norm_type in {"rms_norm"}:
         return MossAudioTokenizerRMSNorm(dim, eps=1e-5, **kwargs)
     elif norm_type in {"rms_norm_f32"}:
+        # 强制 fp32 计算的 RMSNorm（忽略传入 dtype）
         kwargs.pop("dtype", None)
         return MossAudioTokenizerRMSNorm(dim, eps=1e-8, dtype=torch.float, **kwargs)
     else:
@@ -847,45 +941,58 @@ def apply_rope(
     max_period: float = 10_000,
     time_before_heads: bool = False,
 ):
-    """Apply rotary position embedding."""
+    """Apply rotary position embedding.
+
+    RoPE 把每对相邻维度 (x_2i, x_2i+1) 看成一个复数，按位置 t 旋转角度 t*freq_i：
+        (x_2i, x_2i+1) -> (x_2i*cos - x_2i+1*sin, x_2i*sin + x_2i+1*cos)
+    其中 freq_i = max_period^(-2i/D)。
+
+    参数：
+        q, k: [B, H, T, D]（time_before_heads=False）或 [B, T, H, D]；
+        offset: [B]，每个 batch 的起始位置（流式推理时已消耗的帧数）。
+    """
     if time_before_heads:
-        B, T, H, D = q.shape
+        batch_size, seq_len, num_heads, head_dim = q.shape
     else:
-        B, H, T, D = q.shape
+        batch_size, num_heads, seq_len, head_dim = q.shape
     if k.shape != q.shape:
         raise ValueError(f"Expected k.shape == q.shape, got k={tuple(k.shape)} q={tuple(q.shape)}")
-    if D <= 0 or (D % 2) != 0:
-        raise ValueError(f"RoPE requires an even last dimension, got D={D}")
+    if head_dim <= 0 or (head_dim % 2) != 0:
+        raise ValueError(f"RoPE requires an even last dimension, got D={head_dim}")
 
-    ds = torch.arange(D // 2, device=q.device, dtype=torch.float32)
-    freqs = torch.exp(ds * (-math.log(max_period) * 2 / D))
-    ts = offset.float().view(-1, 1) + torch.arange(T, device=q.device, dtype=torch.float32)
+    # 每个维度对的角频率：freq_i = exp(-2i/D * ln(max_period))
+    dim_pair_indices = torch.arange(head_dim // 2, device=q.device, dtype=torch.float32)
+    freqs = torch.exp(dim_pair_indices * (-math.log(max_period) * 2 / head_dim))
+    # 每个 token 的绝对位置 = 起始偏移 + 帧内序号
+    time_positions = offset.float().view(-1, 1) + torch.arange(seq_len, device=q.device, dtype=torch.float32)
 
     if time_before_heads:
-        ts = ts.view(B, -1, 1, 1)
+        time_positions = time_positions.view(batch_size, -1, 1, 1)
     else:
-        ts = ts.view(B, 1, -1, 1)
+        time_positions = time_positions.view(batch_size, 1, -1, 1)
 
-    dims = q.shape[:-1]
-    q = q.view(*dims, D // 2, 2)
-    k = k.view(*dims, D // 2, 2)
+    # 把最后一维拆成 (维度对, 2)，分别作为复数的实部/虚部
+    leading_dims = q.shape[:-1]
+    q = q.view(*leading_dims, head_dim // 2, 2)
+    k = k.view(*leading_dims, head_dim // 2, 2)
 
-    qr, qi = q[..., 0].float(), q[..., 1].float()
-    kr, ki = k[..., 0].float(), k[..., 1].float()
+    q_real, q_imag = q[..., 0].float(), q[..., 1].float()
+    k_real, k_imag = k[..., 0].float(), k[..., 1].float()
 
-    rotr = torch.cos(freqs * ts)
-    roti = torch.sin(freqs * ts)
+    cos_vals = torch.cos(freqs * time_positions)
+    sin_vals = torch.sin(freqs * time_positions)
 
-    qor = qr * rotr - qi * roti
-    qoi = qr * roti + qi * rotr
-    kor = kr * rotr - ki * roti
-    koi = kr * roti + ki * rotr
+    # 复数乘法：(a + bi) * (cos + i·sin)
+    q_out_real = q_real * cos_vals - q_imag * sin_vals
+    q_out_imag = q_real * sin_vals + q_imag * cos_vals
+    k_out_real = k_real * cos_vals - k_imag * sin_vals
+    k_out_imag = k_real * sin_vals + k_imag * cos_vals
 
     dtype = q.dtype
-    qo = torch.stack([qor.to(dtype), qoi.to(dtype)], dim=-1)
-    ko = torch.stack([kor.to(dtype), koi.to(dtype)], dim=-1)
+    q_out = torch.stack([q_out_real.to(dtype), q_out_imag.to(dtype)], dim=-1)
+    k_out = torch.stack([k_out_real.to(dtype), k_out_imag.to(dtype)], dim=-1)
 
-    return qo.view(*dims, D), ko.view(*dims, D)
+    return q_out.view(*leading_dims, head_dim), k_out.view(*leading_dims, head_dim)
 
 
 def apply_rope_with_positions(
@@ -894,34 +1001,38 @@ def apply_rope_with_positions(
     positions: torch.Tensor,
     max_period: float = 10_000,
 ):
-    """Apply rotary position embedding to packed `[N, H, D]` tensors."""
-    N, H, D = q.shape
+    """Apply rotary position embedding to packed `[N, H, D]` tensors.
+
+    与 apply_rope 相同，但用于打包（packed）变长序列：
+    每个 token 的位置由 positions 显式给出，而不是按帧序号推算。
+    """
+    num_tokens, num_heads, head_dim = q.shape
     if k.shape != q.shape:
         raise ValueError(f"Expected k.shape == q.shape, got k={tuple(k.shape)} q={tuple(q.shape)}")
-    if D <= 0 or (D % 2) != 0:
-        raise ValueError(f"RoPE requires an even last dimension, got D={D}")
+    if head_dim <= 0 or (head_dim % 2) != 0:
+        raise ValueError(f"RoPE requires an even last dimension, got D={head_dim}")
 
-    ds = torch.arange(D // 2, device=q.device, dtype=torch.float32)
-    freqs = torch.exp(ds * (-math.log(max_period) * 2 / D))
-    ts = positions.to(torch.float32).view(N, 1, 1)
+    dim_pair_indices = torch.arange(head_dim // 2, device=q.device, dtype=torch.float32)
+    freqs = torch.exp(dim_pair_indices * (-math.log(max_period) * 2 / head_dim))
+    time_positions = positions.to(torch.float32).view(num_tokens, 1, 1)
 
-    qr = q.float().view(N, H, D // 2, 2)[..., 0]
-    qi = q.float().view(N, H, D // 2, 2)[..., 1]
-    kr = k.float().view(N, H, D // 2, 2)[..., 0]
-    ki = k.float().view(N, H, D // 2, 2)[..., 1]
+    q_real = q.float().view(num_tokens, num_heads, head_dim // 2, 2)[..., 0]
+    q_imag = q.float().view(num_tokens, num_heads, head_dim // 2, 2)[..., 1]
+    k_real = k.float().view(num_tokens, num_heads, head_dim // 2, 2)[..., 0]
+    k_imag = k.float().view(num_tokens, num_heads, head_dim // 2, 2)[..., 1]
 
-    rotr = torch.cos(ts * freqs.view(1, 1, -1))
-    roti = torch.sin(ts * freqs.view(1, 1, -1))
+    cos_vals = torch.cos(time_positions * freqs.view(1, 1, -1))
+    sin_vals = torch.sin(time_positions * freqs.view(1, 1, -1))
 
-    qor = qr * rotr - qi * roti
-    qoi = qr * roti + qi * rotr
-    kor = kr * rotr - ki * roti
-    koi = kr * roti + ki * rotr
+    q_out_real = q_real * cos_vals - q_imag * sin_vals
+    q_out_imag = q_real * sin_vals + q_imag * cos_vals
+    k_out_real = k_real * cos_vals - k_imag * sin_vals
+    k_out_imag = k_real * sin_vals + k_imag * cos_vals
 
     dtype = q.dtype
-    qo = torch.stack([qor.to(dtype), qoi.to(dtype)], dim=-1)
-    ko = torch.stack([kor.to(dtype), koi.to(dtype)], dim=-1)
-    return qo.view(N, H, D), ko.view(N, H, D)
+    q_out = torch.stack([q_out_real.to(dtype), q_out_imag.to(dtype)], dim=-1)
+    k_out = torch.stack([k_out_real.to(dtype), k_out_imag.to(dtype)], dim=-1)
+    return q_out.view(num_tokens, num_heads, head_dim), k_out.view(num_tokens, num_heads, head_dim)
 
 
 class MossAudioTokenizerRotaryEmbedding(nn.Module):
@@ -947,7 +1058,13 @@ class MossAudioTokenizerRotaryEmbedding(nn.Module):
 
 
 class MossAudioTokenizerActivationGating(nn.Module):
-    """Gating FFN layer with activation."""
+    """Gating FFN layer with activation.
+
+    门控前馈网络（类似 SwiGLU 的结构）：
+        out = Linear_out( activation(x1) * x2 )
+    其中 (x1, x2) 是 linear_in 输出对半切开的两份。
+    隐藏维度取 2/3 * dim_feedforward，使参数量与普通 FFN 大致持平。
+    """
 
     def __init__(self, dim: int, dim_feedforward: int, activation, **factory_kwargs):
         super().__init__()
@@ -962,8 +1079,9 @@ class MossAudioTokenizerActivationGating(nn.Module):
 
     def forward(self, x: torch.Tensor):
         x = self.linear_in(x)
-        B, T, _ = x.shape
-        x = x.view(B, T, 2, -1)
+        batch_size, seq_len, _ = x.shape
+        x = x.view(batch_size, seq_len, 2, -1)
+        # 一半过激活函数当「门」，另一半作为「值」，逐元素相乘
         x = self.activation(x[..., 0, :]) * x[..., 1, :]
         x = self.linear_out(x)
         return x
@@ -995,7 +1113,11 @@ def create_sin_embedding(
     max_period: float = 10000,
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """Create sinusoidal positional embedding with shape [..., C]."""
+    """Create sinusoidal positional embedding with shape [..., C].
+
+    经典 Transformer 正弦位置编码：前半维 cos、后半维 sin，
+    第 i 个频率为 max_period^(-i/(half_dim-1))。
+    """
     if dim % 2 != 0:
         raise ValueError(f"Sinusoidal embedding requires even dim, got dim={dim}")
     half_dim = dim // 2
@@ -1004,9 +1126,9 @@ def create_sin_embedding(
     if positions.dim() == 0:
         positions = positions.view(1)
     positions = positions.to(dtype).unsqueeze(-1)
-    adim = torch.arange(half_dim, device=positions.device, dtype=dtype)
+    freq_indices = torch.arange(half_dim, device=positions.device, dtype=dtype)
     max_period_tensor = torch.full([], max_period, device=positions.device, dtype=dtype)
-    phase = positions / (max_period_tensor ** (adim / (half_dim - 1)))
+    phase = positions / (max_period_tensor ** (freq_indices / (half_dim - 1)))
     return torch.cat([torch.cos(phase), torch.sin(phase)], dim=-1)
 
 
@@ -1014,7 +1136,15 @@ def pack_padded_sequence(
     x: torch.Tensor,
     input_lengths: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Pack a padded `[B, T, D]` tensor into `[N, D]` plus metadata."""
+    """Pack a padded `[B, T, D]` tensor into `[N, D]` plus metadata.
+
+    把带 padding 的 batch 压成一条不含 padding 的扁平序列，
+    供 flash_attn_varlen_func 使用。返回：
+    - packed_x: [N, D] 有效 token 拼接结果；
+    - valid_mask: [B, T] 原图中的有效位置（解包时用）；
+    - cu_seqlens: [B+1] 各样本在扁平序列中的累计边界；
+    - position_ids: [N] 每个 token 在原序列中的位置。
+    """
     batch_size, max_seqlen, _ = x.shape
     positions = torch.arange(max_seqlen, device=x.device, dtype=torch.long)
     valid_mask = positions.view(1, max_seqlen) < input_lengths.view(batch_size, 1)
@@ -1050,6 +1180,7 @@ class KVCacheResult:
     def __init__(self, keys: torch.Tensor, values: torch.Tensor, positions: torch.Tensor):
         self.keys = keys
         self.values = values
+        # positions[i] = -1 表示该缓存槽尚未写入有效数据
         self.positions = positions
 
     def __iter__(self):
@@ -1058,13 +1189,21 @@ class KVCacheResult:
 
     @staticmethod
     def from_kv(keys: torch.Tensor, values: torch.Tensor) -> KVCacheResult:
-        B, H, T, D = keys.shape
-        positions = torch.arange(T, device=keys.device, dtype=torch.long)
-        return KVCacheResult(keys, values, positions.expand(B, -1))
+        batch_size, num_heads, seq_len, head_dim = keys.shape
+        positions = torch.arange(seq_len, device=keys.device, dtype=torch.long)
+        return KVCacheResult(keys, values, positions.expand(batch_size, -1))
 
 
 class RingKVCache:
-    """Efficient streaming KVCache compatible with CUDA Graph."""
+    """Efficient streaming KVCache compatible with CUDA Graph.
+
+    环形缓冲区 KV 缓存：容量固定为 ``capacity``，新帧写入
+    ``(end_offset + t) % capacity`` 的位置，写满后自动覆盖最旧的帧。
+    因为缓冲区地址和形状固定，所以可以被 CUDA Graph 捕获。
+
+    返回的 ``positions`` 给出每个缓存槽对应的绝对位置（-1 表示无效），
+    注意力据此同时实现「因果 + 只保留最近 context 帧」的掩码。
+    """
 
     def __init__(
         self,
@@ -1077,6 +1216,7 @@ class RingKVCache:
         dtype: torch.dtype = torch.bfloat16,
     ):
         self.capacity = capacity
+        # cache[0] 存 K，cache[1] 存 V
         self.cache = torch.zeros(
             (2, batch_size, num_heads, capacity, dim_per_head),
             device=device,
@@ -1084,6 +1224,7 @@ class RingKVCache:
         )
         self.respect_exec_mask = respect_exec_mask
         if self.respect_exec_mask:
+            # 每个样本各自记录已写入的帧数（连续批处理时样本进度不同）
             self.end_offset = torch.zeros(batch_size, device=device, dtype=torch.long)
         else:
             self.end_offset = torch.zeros(1, device=device, dtype=torch.long)
@@ -1092,16 +1233,21 @@ class RingKVCache:
         self.end_offset[:] = torch.where(reset_mask, torch.zeros_like(self.end_offset), self.end_offset)
 
     def complete(self, k: torch.Tensor, v: torch.Tensor, exec_mask: torch.Tensor) -> KVCacheResult:
-        B, H, T, D = k.shape
-        if T <= 0:
-            raise ValueError(f"Expected T > 0, got T={T}")
+        """写入当前帧的 K/V，并返回整个环形缓存及其绝对位置表。
 
-        indexes = torch.arange(T, device=self.end_offset.device, dtype=self.end_offset.dtype)
+        k, v: [B, H, T, D]，T 为本次写入的帧数（通常很小）。
+        """
+        batch_size, num_heads, seq_len, head_dim = k.shape
+        if seq_len <= 0:
+            raise ValueError(f"Expected T > 0, got T={seq_len}")
+
+        # 本次写入的环形下标：(end_offset + t) % capacity
+        indexes = torch.arange(seq_len, device=self.end_offset.device, dtype=self.end_offset.dtype)
         indexes = indexes + self.end_offset.view(-1, 1)
         indexes = indexes % self.capacity
 
         if self.respect_exec_mask:
-            this_indexes = indexes.view(B, 1, T, 1).expand(-1, H, T, D)
+            this_indexes = indexes.view(batch_size, 1, seq_len, 1).expand(-1, num_heads, seq_len, head_dim)
             self.cache[0].scatter_(2, this_indexes, k)
             self.cache[1].scatter_(2, this_indexes, v)
         else:
@@ -1111,8 +1257,10 @@ class RingKVCache:
         keys = self.cache[0]
         values = self.cache[1]
 
+        # 由环形下标反推每个槽位的绝对位置：
+        # 最新一帧位于 last_offset，往前每绕一圈位置减 capacity
         indexes = torch.arange(self.capacity, device=self.end_offset.device, dtype=torch.long)
-        last_offset = self.end_offset.view(-1, 1) + T - 1
+        last_offset = self.end_offset.view(-1, 1) + seq_len - 1
         end_index = last_offset % self.capacity
         delta = indexes - end_index
 
@@ -1123,10 +1271,11 @@ class RingKVCache:
         )
 
         if self.respect_exec_mask:
-            self.end_offset[:] = torch.where(exec_mask, self.end_offset + T, self.end_offset)
+            self.end_offset[:] = torch.where(exec_mask, self.end_offset + seq_len, self.end_offset)
         else:
-            self.end_offset.add_(T)
+            self.end_offset.add_(seq_len)
 
+        # 尚未写入过的槽位（下标 >= 已写入帧数）标记为无效
         invalid = indexes >= self.end_offset.view(-1, 1)
         positions = torch.where(invalid, torch.full_like(positions, -1), positions)
 
@@ -1141,6 +1290,13 @@ class RingKVCache:
 _sync_module_proxy()
 @dataclass
 class MHAState(StreamingState):
+    """多头注意力的流式状态：滑窗 KV cache + 各样本已消耗的帧数偏移。
+
+    - ``cached_keys/values``: [B, H, context, D] 滑窗内的历史 K/V；
+    - ``cached_positions``: [B, context] 各缓存槽的绝对位置，-1 表示空槽；
+    - ``offset``: [B] 每个样本已处理的帧数（RoPE 的起始位置）。
+    """
+
     cached_keys: torch.Tensor | None
     cached_values: torch.Tensor | None
     cached_positions: torch.Tensor | None
@@ -1163,7 +1319,11 @@ def apply_weights_per_step(
     x: torch.Tensor,
     offset: int | None,
 ) -> torch.Tensor:
-    """Apply different weights for each time step."""
+    """Apply different weights for each time step.
+
+    某些模块在不同时间步使用不同的权重副本：第 t 帧用 modules[schedule[t]]
+    （无 schedule 时用 modules[t]）。只有单个模块时直接复用。
+    """
     if len(modules) == 1:
         return modules[0](x)
 
@@ -1173,9 +1333,9 @@ def apply_weights_per_step(
         raise ValueError(
             f"Per-step weights require a dense `[B, T, C]` tensor when len(modules) > 1, got shape {tuple(x.shape)}."
         )
-    ys = []
-    B, T, C = x.shape
-    for t in range(T):
+    outputs = []
+    batch_size, seq_len, hidden_dim = x.shape
+    for t in range(seq_len):
         module_index = t + offset
         if schedule is not None:
             if module_index >= len(schedule) or module_index < 0:
@@ -1185,13 +1345,23 @@ def apply_weights_per_step(
             module_index = schedule[module_index]
         if module_index >= len(modules) or module_index < 0:
             raise ValueError(f"module_index={module_index} out of range for len(modules)={len(modules)}.")
-        y = modules[module_index](x[:, t : t + 1])
-        ys.append(y)
-    return torch.cat(ys, 1)
+        output_t = modules[module_index](x[:, t : t + 1])
+        outputs.append(output_t)
+    return torch.cat(outputs, 1)
 
 
 class MossAudioTokenizerMultiheadAttention(StreamingModule):
-    """Multi-head attention with streaming support."""
+    """Multi-head attention with streaming support.
+
+    支持四种执行路径，由是否流式 + 注意力后端决定：
+    - 非流式 + sdpa：[B, T, C] 稠密输入，内部构造因果/padding 掩码；
+    - 非流式 + flash_attention_2：[N, C] 打包变长输入（配 cu_seqlens）；
+    - 流式 + sdpa / flash_attention_2：维护滑窗 KV cache，逐块前向；
+    - 流式 + flash kvcache 内核（_use_flash_kvcache=True）：CUDA Graph 场景。
+
+    ``context`` 是滑窗注意力的窗口长度（帧数）；None 表示无限上下文
+    （无限上下文不支持连续批处理流式）。
+    """
 
     def __init__(
         self,
@@ -1234,6 +1404,7 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
 
     @staticmethod
     def _load_hook(module, state_dict, prefix, *_):
+        """兼容旧 checkpoint 的权重键名：统一改写成 in_proj/out_proj。"""
         mappings = {
             "in_proj_weight": "in_proj.weight",
             "in_projs.0.weight": "in_proj.weight",
@@ -1257,9 +1428,11 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         )
 
     def _supports_flash_attention(self, device: torch.device, dtype: torch.dtype) -> bool:
+        """flash_attention_2 只在 CUDA + fp16/bf16 下可用。"""
         return _has_flash_attn() and device.type == "cuda" and dtype in {torch.float16, torch.bfloat16}
 
     def _get_backend_check_dtype(self, x: torch.Tensor) -> torch.dtype:
+        """判断注意力内核实际会看到的数据类型（考虑 autocast）。"""
         if x.device.type != "cuda":
             return x.dtype
         try:
@@ -1274,6 +1447,7 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
             return torch.get_autocast_gpu_dtype()
 
     def resolve_attention_implementation(self, x: torch.Tensor, is_streaming: bool) -> str:
+        """解析实际生效的注意力后端；flash 不可用时回退到 sdpa。"""
         if self.attention_implementation == "sdpa":
             return "sdpa"
         backend_dtype = self._get_backend_check_dtype(x)
@@ -1293,6 +1467,11 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         self,
         x: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """一次性算出 Q/K/V 并拆分多头。
+
+        3D 输入 [B, T, C] -> 返回 [B, H, T, D] 三元组；
+        2D 打包输入 [N, C] -> 返回 [N, H, D] 三元组。
+        """
         dim_per_head = self.embed_dim // self.num_heads
         if x.dim() == 3:
             projected = self.in_proj(x)
@@ -1307,6 +1486,7 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         raise ValueError(f"Expected a 2D or 3D tensor, got shape {tuple(x.shape)}")
 
     def _apply_dense_rope(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """非流式 RoPE：所有样本从位置 0 开始。"""
         if self.rope is None:
             return q, k
         offset = torch.zeros(q.shape[0], device=q.device, dtype=torch.long)
@@ -1318,6 +1498,7 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         k: torch.Tensor,
         position_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """打包序列的 RoPE：位置由 position_ids 显式给出。"""
         if self.rope is None:
             return q, k
         return apply_rope_with_positions(q, k, position_ids, max_period=self.rope.max_period)
@@ -1329,6 +1510,7 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         device: torch.device,
         dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """懒初始化流式滑窗 KV cache，并保证其 device/dtype 与当前输入一致。"""
         head_dim = self.embed_dim // self.num_heads
         cache_length = 0 if self.context is None else self.context
         if state.cached_keys is None or state.cached_values is None or state.cached_positions is None:
@@ -1338,6 +1520,7 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
                 dtype=dtype,
             )
             state.cached_values = torch.zeros_like(state.cached_keys)
+            # 位置全部初始化为 -1（空槽）
             state.cached_positions = torch.full(
                 (batch_size, cache_length),
                 -1,
@@ -1360,6 +1543,7 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         device: torch.device,
         dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """懒初始化 flash_attn_with_kvcache 所需的 KV cache（布局 [B, context, H, D]）。"""
         if self.context is None:
             raise RuntimeError("flash_attn_with_kvcache requires a finite streaming context.")
         head_dim = self.embed_dim // self.num_heads
@@ -1390,6 +1574,7 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         v_cur: torch.Tensor,
         pos_q: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """把历史缓存与当前帧的 K/V 拼接成完整的注意力上下文。"""
         k_all = torch.cat([cached_k, k_cur], dim=2)
         v_all = torch.cat([cached_v, v_cur], dim=2)
         pos_k = torch.cat([cached_pos, pos_q], dim=1)
@@ -1405,9 +1590,14 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         v_all: torch.Tensor,
         pos_k: torch.Tensor,
     ) -> None:
+        """把最新 K/V 写回流式缓存（只保留最近 context 帧）。
+
+        exec_mask 为 False 的样本（已结束）保持原缓存不动。
+        """
         exec_mask = state.exec_mask.view(-1, 1, 1, 1)
         exec_mask_pos = state.exec_mask.view(-1, 1)
         if self.context is None:
+            # 无限上下文：缓存无限增长，要求所有样本同步推进
             if not bool(state.exec_mask.all().item()):
                 raise RuntimeError("Streaming exec_mask with context=None is not supported.")
             state.cached_keys = k_all.contiguous()
@@ -1418,6 +1608,7 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         assert state.cached_keys is not None
         assert state.cached_values is not None
         assert state.cached_positions is not None
+        # 滑窗：只保留末尾 context 帧
         new_cached_k = k_all[:, :, -self.context :, :].contiguous()
         new_cached_v = v_all[:, :, -self.context :, :].contiguous()
         new_cached_pos = pos_k[:, -self.context :].contiguous()
@@ -1426,6 +1617,7 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         state.cached_positions.copy_(torch.where(exec_mask_pos, new_cached_pos, cached_pos))
 
     def _build_streaming_sdpa_bias(self, pos_q: torch.Tensor, pos_k: torch.Tensor) -> torch.Tensor:
+        """流式注意力的布尔掩码：因果（k 不晚于 q）+ 滑窗（k 在 q 前 context 帧内）。"""
         delta = pos_q[:, :, None] - pos_k[:, None, :]
         attn_bias = (pos_k[:, None, :] >= 0) & (delta >= 0)
         if self.context is not None:
@@ -1438,6 +1630,7 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         max_seqlen: int,
         device: torch.device,
     ) -> torch.Tensor:
+        """非流式注意力的布尔掩码：padding 掩码，按需叠加因果与滑窗约束。"""
         positions = torch.arange(max_seqlen, device=device, dtype=torch.long)
         valid_k = positions.view(1, 1, max_seqlen) < input_lengths.view(-1, 1, 1)
         if not self.causal and self.context is None:
@@ -1460,6 +1653,7 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         max_seqlen_q: int,
         max_seqlen_k: int,
     ) -> torch.Tensor:
+        """调用 flash_attn_varlen_func；滑窗通过 window_size 参数实现。"""
         flash_attn_varlen_func = _get_flash_attn_varlen_func()
         if flash_attn_varlen_func is None:
             raise RuntimeError("flash-attn is not installed.")
@@ -1480,9 +1674,11 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         )
 
     def _forward_streaming_sdpa(self, x: torch.Tensor, state: MHAState) -> torch.Tensor:
+        """流式 + SDPA：历史 K/V 与当前帧拼接后做注意力，再回写滑窗缓存。"""
         batch_size, chunk_length, _ = x.shape
         q, k_cur, v_cur = self._project_qkv(x)
         if self.rope is not None:
+            # RoPE 位置 = 已消耗帧数偏移 + 块内序号
             q, k_cur = self.rope(q, k_cur, state.offset, time_before_heads=False)
         pos_q = state.offset.view(-1, 1) + torch.arange(chunk_length, device=x.device, dtype=torch.long).view(1, -1)
         cached_k, cached_v, cached_pos = self._ensure_streaming_cache(state, batch_size, k_cur.device, k_cur.dtype)
@@ -1492,10 +1688,12 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         out = out.transpose(1, 2).reshape(batch_size, chunk_length, self.embed_dim)
 
         self._update_streaming_cache(state, cached_k, cached_v, cached_pos, k_all, v_all, pos_k)
+        # 只推进活跃样本的位置偏移
         state.offset[:] = torch.where(state.exec_mask, state.offset + chunk_length, state.offset)
         return out
 
     def _forward_streaming_flash(self, x: torch.Tensor, state: MHAState) -> torch.Tensor:
+        """流式 + flash_attn_varlen：逐样本去掉无效缓存槽，拼成变长序列一次算完。"""
         batch_size, chunk_length, _ = x.shape
         q, k_cur, v_cur = self._project_qkv(x)
         if self.rope is not None:
@@ -1504,6 +1702,8 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         cached_k, cached_v, cached_pos = self._ensure_streaming_cache(state, batch_size, k_cur.device, k_cur.dtype)
         k_all, v_all, pos_k = self._build_streaming_kv(cached_k, cached_v, cached_pos, k_cur, v_cur, pos_q)
 
+        # flash varlen 接口要求把所有样本拼成一条扁平序列：
+        # 每个样本贡献 chunk_length 个 query 与「有效缓存 + 当前帧」个 key/value
         q_chunks = []
         k_chunks = []
         v_chunks = []
@@ -1513,6 +1713,7 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
 
         for batch_idx in range(batch_size):
             valid_k = pos_k[batch_idx] >= 0
+            # [H, T, D] -> [T, H, D]
             q_i = q[batch_idx].transpose(0, 1).contiguous()
             k_i = k_all[batch_idx, :, valid_k, :].transpose(0, 1).contiguous()
             v_i = v_all[batch_idx, :, valid_k, :].transpose(0, 1).contiguous()
@@ -1533,6 +1734,7 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
             max_seqlen_k=max_kv_len,
         )
 
+        # 把扁平输出按样本切回 [B, H, T, D]
         outputs = []
         start = 0
         for _ in range(batch_size):
@@ -1546,6 +1748,7 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         return out
 
     def _forward_streaming_flash_kvcache(self, x: torch.Tensor, state: MHAState) -> torch.Tensor:
+        """流式 + flash_attn_with_kvcache：K/V 由内核直接写入缓存，可被 CUDA Graph 捕获。"""
         flash_attn_with_kvcache = _get_flash_attn_with_kvcache()
         if self.context is None:
             raise RuntimeError("flash_attn_with_kvcache requires a finite streaming context.")
@@ -1557,10 +1760,12 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         if self.rope is not None:
             q, k_cur = self.rope(q, k_cur, state.offset, time_before_heads=False)
 
+        # [B, H, T, D] -> [B, T, H, D]（flash kvcache 内核要求的布局）
         q = q.transpose(1, 2).contiguous()
         k_cur = k_cur.transpose(1, 2).contiguous()
         v_cur = v_cur.transpose(1, 2).contiguous()
 
+        # 已结束样本的 K/V 清零，避免污染缓存（其 offset 不推进，写入位置会被覆盖）
         exec_mask = state.exec_mask.view(batch_size, 1, 1, 1).to(dtype=k_cur.dtype)
         k_cur = k_cur * exec_mask
         v_cur = v_cur * exec_mask
@@ -1587,6 +1792,7 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         return out
 
     def _forward_non_streaming_sdpa(self, x: torch.Tensor, input_lengths: torch.Tensor) -> torch.Tensor:
+        """非流式 + SDPA：整段输入一次算完，带 padding/因果/滑窗掩码。"""
         batch_size, max_seqlen, _ = x.shape
         q, k, v = self._project_qkv(x)
         q, k = self._apply_dense_rope(q, k)
@@ -1608,6 +1814,7 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         max_seqlen: int,
         position_ids: torch.Tensor,
     ) -> torch.Tensor:
+        """非流式 + flash：输入是打包好的 [N, C] 变长序列。"""
         q, k, v = self._project_qkv(x)
         q, k = self._apply_packed_rope(q, k, position_ids)
         out = self._run_flash_attention(q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen)
@@ -1621,6 +1828,7 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         position_ids: torch.Tensor | None = None,
         input_lengths: torch.Tensor | None = None,
     ):
+        """按「是否流式 + 实际注意力后端」分发到对应的执行路径。"""
         state = cast(MHAState | None, self._streaming_state)
         backend = self.resolve_attention_implementation(query, is_streaming=state is not None)
 
@@ -1663,7 +1871,12 @@ class LayerState(StreamingState):
 
 
 class MossAudioTokenizerTransformerLayer(StreamingModule):
-    """Transformer layer with streaming support."""
+    """Transformer layer with streaming support.
+
+    预归一化（pre-norm）结构：
+        x = x + layer_scale_1(attn(norm1(x)))
+        x = x + layer_scale_2(ffn(norm2(x)))
+    """
 
     def __init__(
         self,
@@ -1718,6 +1931,7 @@ class MossAudioTokenizerTransformerLayer(StreamingModule):
 
     @staticmethod
     def _load_hook(module, state_dict, prefix, *_):
+        """兼容旧 checkpoint：linear1/linear2 键名改写为 ffn.0/ffn.2。"""
         mappings = {
             "linear1.weight": "ffn.0.weight",
             "linear2.weight": "ffn.2.weight",
@@ -1734,6 +1948,7 @@ class MossAudioTokenizerTransformerLayer(StreamingModule):
         return LayerState(batch_size, device)
 
     def forward(self, x: torch.Tensor, **kwargs):
+        # 预归一化 + 残差连接；residual.to(x) 对齐 norm 可能切换的 dtype
         residual = x
         x = self.norm1(x)
         x = residual.to(x) + self.layer_scale_1(self.self_attn(x, **kwargs))
@@ -1751,6 +1966,8 @@ class MossAudioTokenizerTransformerLayer(StreamingModule):
 _sync_module_proxy()
 @dataclass
 class TransformerState(StreamingState):
+    """Transformer 整体的流式状态：每个样本已处理的帧数（用于正弦位置编码）。"""
+
     offsets: torch.Tensor
 
     def reset(self, reset_mask: torch.Tensor):
@@ -1825,10 +2042,11 @@ class MossAudioTokenizerTransformer(StreamingModule):
             cast(MossAudioTokenizerTransformerLayer, layer).self_attn.set_attention_implementation(attention_implementation)
 
     def forward(self, x: torch.Tensor, **kwargs):
-        C = x.shape[-1]
+        hidden_dim = x.shape[-1]
         state = self._streaming_state
         if x.dim() == 3:
-            B, T, _ = x.shape
+            batch_size, seq_len, _ = x.shape
+            # 位置偏移：流式时用各样本已处理帧数，非流式从 0 开始
             offsets = (
                 torch.zeros(1, dtype=torch.long, device=x.device)
                 if state is None
@@ -1839,32 +2057,39 @@ class MossAudioTokenizerTransformer(StreamingModule):
                 )
             )
         else:
-            B = 0
-            T = 0
+            batch_size = 0
+            seq_len = 0
             offsets = None
 
+        # 正弦位置编码（"rope" 模式只作用于注意力内部，这里跳过）
         if self.positional_embedding in {"sin", "sin_rope"}:
             if x.dim() == 3:
-                positions = torch.arange(T, device=x.device).view(1, -1) + cast(torch.Tensor, offsets).view(-1, 1)
+                positions = torch.arange(seq_len, device=x.device).view(1, -1) + cast(torch.Tensor, offsets).view(-1, 1)
             else:
                 position_ids = kwargs.get("position_ids")
                 if position_ids is None:
                     raise ValueError("Packed transformer inputs require position_ids when using sinusoidal embeddings.")
                 positions = position_ids
-            pos_emb = create_sin_embedding(positions, C, max_period=self.max_period, dtype=x.dtype)
+            pos_emb = create_sin_embedding(positions, hidden_dim, max_period=self.max_period, dtype=x.dtype)
             x = x + self.positional_scale * pos_emb
 
         for layer in self.layers:
             x = layer(x, **kwargs)
 
+        # 推进流式位置偏移（只推进活跃样本）
         if state is not None and x.dim() == 3:
             assert isinstance(state, TransformerState)
-            state.offsets[:] = torch.where(state.exec_mask, state.offsets + T, state.offsets)
+            state.offsets[:] = torch.where(state.exec_mask, state.offsets + seq_len, state.offsets)
         return x
 
 
 class MossAudioTokenizerProjectedTransformer(StreamingContainer):
-    """Transformer with input/output projections."""
+    """Transformer with input/output projections.
+
+    输入投影 -> Transformer -> 输出投影 的组合模块。
+    对外接口是 [B, D, T]（卷积布局），内部转成 [B, T, D] 跑 Transformer。
+    ``downsample_ratio=1``：不改变帧率。
+    """
 
     def __init__(
         self,
@@ -1893,6 +2118,7 @@ class MossAudioTokenizerProjectedTransformer(StreamingContainer):
     def forward(self, x, input_lengths, **kwargs):
         x = self.input_proj(x.transpose(1, 2))  # (B, D, T) -> (B, T, D)
         if not self.is_streaming and self.transformer.resolve_attention_implementation(x) == "flash_attention_2":
+            # 非流式 + flash：去掉 padding 打包成变长序列再算，算完恢复
             batch_size, max_seqlen, _ = x.shape
             if max_seqlen > 0 and bool(input_lengths.any().item()):
                 max_valid_seqlen = int(input_lengths.max().item())
@@ -1920,7 +2146,13 @@ class MossAudioTokenizerProjectedTransformer(StreamingContainer):
 
 
 class MossAudioTokenizerPatchedPretransform(nn.Module):
-    """Patching module for downsampling/upsampling."""
+    """Patching module for downsampling/upsampling.
+
+    纯张量重排的「补丁化」变换，无可学习参数：
+    - 下采样（编码器侧）：把相邻 patch_size 帧的特征拼到通道维，
+      [B, D, T] -> [B, D*patch, T/patch]，帧率降低 patch 倍；
+    - 上采样（解码器侧）：逆变换，[B, D*patch, T] -> [B, D, T*patch]。
+    """
 
     def __init__(self, patch_size: int, is_downsample: bool, module_type: str, **kwargs):
         super().__init__()
@@ -1930,19 +2162,21 @@ class MossAudioTokenizerPatchedPretransform(nn.Module):
         self.module_type = module_type
 
     def encode(self, x, input_lengths):
-        b, d, _ = x.shape
-        h = self.patch_size
-        x = x.reshape(b, d, -1, h).permute(0, 1, 3, 2).reshape(b, d * h, -1)
+        batch_size, channels, _ = x.shape
+        patch = self.patch_size
+        # [B, D, T] -> [B, D, T/patch, patch] -> [B, D, patch, T/patch] -> [B, D*patch, T/patch]
+        x = x.reshape(batch_size, channels, -1, patch).permute(0, 1, 3, 2).reshape(batch_size, channels * patch, -1)
         # We pad the input waveform to a multiple of `downsample_rate` before applying the encoder.
         # Use a ceil division to match that padding and avoid dropping the last (partially padded) frame.
         output_lengths = input_lengths // self.patch_size
         return x, output_lengths
 
     def decode(self, x, input_lengths):
-        b, dh, l = x.shape
-        h = self.patch_size
-        d = dh // h
-        x = x.reshape(b, d, h, l).permute(0, 1, 3, 2).reshape(b, d, l * h)
+        batch_size, channels_times_patch, length = x.shape
+        patch = self.patch_size
+        channels = channels_times_patch // patch
+        # encode 的逆变换
+        x = x.reshape(batch_size, channels, patch, length).permute(0, 1, 3, 2).reshape(batch_size, channels, length * patch)
         output_lengths = input_lengths * self.patch_size
         return x, output_lengths
 
@@ -1964,6 +2198,7 @@ def WNConv1d(*args, **kwargs):
 
 
 def remap_weight_norm_state_dict_keys(state_dict: dict[str, torch.Tensor], prefix: str) -> None:
+    """兼容旧 checkpoint：把 weight_g/weight_v 键名改写为新版 parametrizations 格式。"""
     replacements = (
         (".weight_g", ".parametrizations.weight.original0"),
         (".weight_v", ".parametrizations.weight.original1"),
@@ -1979,7 +2214,11 @@ def remap_weight_norm_state_dict_keys(state_dict: dict[str, torch.Tensor], prefi
 
 
 class MossAudioTokenizerVectorQuantize(nn.Module):
-    """Single codebook vector quantization (inference only)."""
+    """Single codebook vector quantization (inference only).
+
+    最近邻量化：在码本中找与输入向量距离最近的码字。
+    距离用展开式 ||x - c||^2 = ||x||^2 - 2·x·c + ||c||^2 计算，等价于 argmax 内积项。
+    """
 
     def __init__(
         self,
@@ -2038,7 +2277,11 @@ class MossAudioTokenizerVectorQuantize(nn.Module):
 
 
 class MossAudioTokenizerLFQ(nn.Module):
-    """LFQ (inference-only) used by ResidualLFQ."""
+    """LFQ (inference-only) used by ResidualLFQ.
+
+    与 VQ 类似，但先把输入与码本都做 L2 归一化再求最近邻
+    （Lookup-Free Quantization 的推理路径，与训练时行为对齐）。
+    """
 
     def __init__(
         self,
@@ -2102,7 +2345,11 @@ class MossAudioTokenizerLFQ(nn.Module):
 
 
 class MossAudioTokenizerResidualVQ(nn.Module):
-    """Residual Vector Quantization (inference only)."""
+    """Residual Vector Quantization (inference only).
+
+    残差向量量化：第 1 层码本量化原始特征，第 i 层量化前面所有层的残差，
+    各层码字索引堆叠成 (n_quantizers, B, T) 的音频 token。
+    """
 
     def __init__(
         self,
@@ -2169,6 +2416,7 @@ class MossAudioTokenizerResidualVQ(nn.Module):
             z = self.input_proj(z).float()
 
             batch_size, _, max_time = z.shape
+            # padding 位置掩码：量化与残差更新都只在有效位置进行
             mask = torch.arange(max_time, device=z.device).expand(batch_size, max_time) < input_length.unsqueeze(1)
 
             quantized_out = torch.zeros_like(z, dtype=torch.float32)
@@ -2195,7 +2443,10 @@ class MossAudioTokenizerResidualVQ(nn.Module):
         return quantized_out, all_indices, input_length
 
     def decode_codes(self, codes: torch.Tensor) -> torch.Tensor:
-        """Decode codes from multiple quantizers to embeddings."""
+        """Decode codes from multiple quantizers to embeddings.
+
+        各层码本的 embedding 直接相加（残差量化的逆过程）。
+        """
         with disable_cuda_autocast():
             nq, B, T = codes.shape
             emb = torch.zeros(B, self.rvq_dim, T, device=codes.device, dtype=torch.float32)
@@ -2210,7 +2461,10 @@ class MossAudioTokenizerResidualVQ(nn.Module):
 
 
 class MossAudioTokenizerResidualLFQ(nn.Module):
-    """Residual LFQ (inference only)."""
+    """Residual LFQ (inference only).
+
+    与 ResidualVQ 结构相同，但每层使用 LFQ（L2 归一化后最近邻）量化器。
+    """
 
     def __init__(
         self,
@@ -2263,7 +2517,10 @@ class MossAudioTokenizerResidualLFQ(nn.Module):
         input_length: torch.Tensor,
         n_quantizers: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Inference quantization."""
+        """Inference quantization.
+
+        逐层量化残差，padding 位置不参与；返回 (量化结果, 各层码本索引, 有效长度)。
+        """
         with disable_cuda_autocast():
             z = self.input_proj(z).float()
 
@@ -2296,6 +2553,7 @@ class MossAudioTokenizerResidualLFQ(nn.Module):
         return quantized_out, all_indices, input_length
 
     def decode_codes(self, codes: torch.Tensor) -> torch.Tensor:
+        """各层码本的 embedding 直接相加（残差量化的逆过程）。"""
         with disable_cuda_autocast():
             nq, B, T = codes.shape
             emb = torch.zeros(B, self.rvq_dim, T, device=codes.device, dtype=torch.float32)
@@ -2353,6 +2611,8 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         self.compute_dtype_name = config.compute_dtype
         self.compute_dtype = resolve_compute_dtype(config.compute_dtype)
 
+        # 编码器中各 causal Transformer 的上下文时长取最小值，
+        # 作为整个模型对外宣称的流式上下文能力
         encoder_context_durations = [
             float(module_kwargs.get("context_duration", config.causal_transformer_context_duration))
             for module_kwargs in config.encoder_kwargs
@@ -2362,7 +2622,8 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
             min(encoder_context_durations) if encoder_context_durations else config.causal_transformer_context_duration
         )
 
-        # Build encoder
+        # ---- 构建编码器 ----
+        # 多声道交错时，所有声道被压成一条流，等效帧率 = 采样率 * 声道数
         channel_interleave_factor = (
             self.number_channels if self.enable_channel_interleave and self.number_channels > 1 else 1
         )
@@ -2374,6 +2635,7 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
             if encoder_kwargs_i["module_type"] == "PatchedPretransform":
                 self.encoder.append(MossAudioTokenizerPatchedPretransform(**encoder_kwargs_i, is_downsample=True))
             elif encoder_kwargs_i["module_type"] == "Transformer":
+                # context_duration（秒）按当前帧率换算成帧数
                 context_duration = float(encoder_kwargs_i.pop("context_duration", self.causal_transformer_context_duration))
                 self.encoder.append(
                     MossAudioTokenizerProjectedTransformer(
@@ -2382,9 +2644,10 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
                         attention_implementation=self.attention_implementation,
                     )
                 )
+            # 每经过一个模块，帧率除以其下采样率（Transformer 为 1）
             current_frame_rate /= self.encoder[-1].downsample_ratio
 
-        # Build quantizer
+        # ---- 构建量化器 ----
         quantizer_kwargs = dict(config.quantizer_kwargs)
         quantizer_type = quantizer_kwargs.get("quantizer_type", getattr(config, "quantizer_type", "rvq"))
         if quantizer_type in {"rvq", "spec_rvq"}:
@@ -2394,7 +2657,7 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         else:
             raise ValueError(f"Unsupported quantizer_type: {quantizer_type}")
 
-        # Build decoder
+        # ---- 构建解码器（与编码器镜像，逐级把帧率升回采样率）----
         decoder_kwargs_list = copy.deepcopy(config.decoder_kwargs)
         self.decoder = nn.ModuleList()
 
@@ -2411,8 +2674,10 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
                         attention_implementation=self.attention_implementation,
                     )
                 )
+            # 解码器侧帧率乘以上采样率
             current_frame_rate *= self.decoder[-1].downsample_ratio
 
+        # 校验：解码器出口帧率必须正好回到输入侧帧率
         expected_output_frame_rate = float(self.sampling_rate * channel_interleave_factor)
         if int(round(current_frame_rate)) != int(round(expected_output_frame_rate)):
             raise ValueError(
@@ -2421,6 +2686,7 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
             )
 
         self.post_init()
+        # 流式批解码会话的簿记字段
         self._active_decode_session: "MossAudioTokenizerDecodeSession | None" = None
         self._batch_decode_streaming_max_batch_size: int | None = None
         self._batch_decode_streaming_batch_size: int | None = None
@@ -2432,6 +2698,7 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         max_batch_size: int,
         use_cuda_graph: bool = False,
     ) -> MossAudioTokenizerDecodeSession:
+        """创建连续批处理流式解码会话（同一时刻只允许一个活跃会话）。"""
         active_session = self._active_decode_session
         if active_session is not None and not active_session._closed:
             raise RuntimeError(_ACTIVE_DECODE_SESSION_ERROR_MESSAGE)
@@ -2444,6 +2711,7 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         return session
 
     def _reset_batch_decode_streaming_state(self) -> None:
+        """关闭并清理 batch_decode(streaming=True) 使用的内部会话。"""
         streaming_session = self._batch_decode_streaming_session
         self._batch_decode_streaming_session = None
         self._batch_decode_streaming_max_batch_size = None
@@ -2458,6 +2726,7 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         max_batch_size: int | None,
         reset_stream: bool,
     ) -> int:
+        """校验并确定流式批解码的最大批大小（只能在首次调用时设定）。"""
         if reset_stream:
             self._reset_batch_decode_streaming_state()
 
@@ -2486,6 +2755,7 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         max_batch_size: int,
         use_cuda_graph: bool = False,
     ) -> MossAudioTokenizerDecodeSession:
+        """获取或创建流式批解码会话；已存在时校验配置一致并复用。"""
         session = self._batch_decode_streaming_session
         if session is not None and not session._closed:
             if session._use_cuda_graph != use_cuda_graph:
@@ -2506,6 +2776,7 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         session: MossAudioTokenizerDecodeSession,
         target_batch_size: int,
     ) -> None:
+        """为新增的 batch 行注册解码请求（request_id 自增分配）。"""
         requests_to_append = target_batch_size - len(session.active_request_ids)
         for _ in range(requests_to_append):
             request_id = self._batch_decode_streaming_next_request_id
@@ -2517,6 +2788,7 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         request_ids: list[str | int],
         finalize_indices: list[int] | tuple[int, ...] | None,
     ) -> list[str | int]:
+        """把「本次调用后要结束的样本下标」翻译成对应的 request_id 列表。"""
         normalized_finalize_indices = tuple(finalize_indices) if finalize_indices is not None else ()
         if len(set(normalized_finalize_indices)) != len(normalized_finalize_indices):
             raise ValueError(_BATCH_DECODE_STREAMING_DUPLICATE_FINALIZE_INDICES_ERROR_MESSAGE)
@@ -2535,6 +2807,7 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         return finalize_request_ids
 
     def _raise_if_plain_decode_conflicts_with_active_session(self) -> None:
+        """普通（非流式）解码与活跃的解码会话互斥，冲突时报错。"""
         active_session = self._active_decode_session
         if active_session is not None and not getattr(active_session, "_closed", False):
             raise RuntimeError(_PLAIN_DECODE_SESSION_CONFLICT_ERROR_MESSAGE)
@@ -2565,7 +2838,10 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
 
     @contextmanager
     def streaming(self, batch_size: int = 1):
-        """Context manager for streaming mode."""
+        """Context manager for streaming mode.
+
+        进入时为所有流式模块分配状态，退出时统一清除。
+        """
         self._start_streaming(batch_size)
         try:
             yield
@@ -2573,6 +2849,7 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
             self._stop_streaming()
 
     def _set_streaming_exec_mask(self, exec_mask: torch.Tensor) -> None:
+        """广播设置所有流式模块的执行掩码（分块批处理中标记活跃样本）。"""
         exec_mask = exec_mask.to(torch.bool)
 
         def _set_exec_mask(module: nn.Module):
@@ -2587,6 +2864,14 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         max_step_length: int,
         alignment: int,
     ) -> tuple[int, torch.Tensor]:
+        """规划一次分块流式步进：步长 + 本步参与计算的样本掩码。
+
+        策略：
+        - 优先让所有样本都走满 max_step_length；
+        - 否则取「剩余最少」样本的剩余长度（按 alignment 向下对齐），
+          这样至少有一条样本在本步走完；
+        返回 (step_length, active_mask)。
+        """
         positive_mask = remaining > 0
         if not bool(positive_mask.any().item()):
             raise RuntimeError("Cannot plan a streaming step when no samples remain.")
@@ -2611,6 +2896,7 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         return step_length, remaining >= step_length
 
     def _infer_num_quantizers(self, codes_chunks: list[list[torch.Tensor]], requested_num_quantizers: int | None) -> int:
+        """从分块编码结果推断码本层数（所有块都为空时回退到量化器配置）。"""
         if requested_num_quantizers is not None:
             return requested_num_quantizers
         for chunks_i in codes_chunks:
@@ -2629,6 +2915,7 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
 
     @contextmanager
     def _codec_inference_autocast(self):
+        """按 compute_dtype 启用 CUDA autocast（fp32 时不做任何事）。"""
         device = next(self.parameters()).device
         if device.type == "cuda" and self.compute_dtype is not None:
             with torch.autocast(device_type="cuda", dtype=self.compute_dtype):
@@ -2650,6 +2937,7 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         self,
         wav_list: list[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """把若干长度不一的波形整理成右 padding 的 [B, C, T] batch 及长度表。"""
         if len(wav_list) == 0:
             raise ValueError("`wav_list` must contain at least one waveform.")
 
@@ -2661,6 +2949,7 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         normalized_wavs: list[torch.Tensor] = []
         for i, wav in enumerate(wav_list):
             if self.number_channels == 1:
+                # 单声道模型：接受 (T,) 或 (1, T)
                 if wav.dim() == 1:
                     wav_i = wav.unsqueeze(0)
                 elif wav.dim() == 2 and wav.shape[0] == 1:
@@ -2690,6 +2979,7 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         codes_list: list[torch.Tensor],
         num_quantizers: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, int]:
+        """把若干 [nq_i, T_i] 的码本整理成 [nq, B, T_max] 的 batch 及长度表。"""
         if len(codes_list) == 0:
             raise ValueError("`codes_list` must contain at least one code tensor.")
 
@@ -2697,6 +2987,7 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         device = codes_list[0].device
         nqs = [codes.shape[0] for codes in codes_list]
         if num_quantizers is None:
+            # 未指定层数时要求所有样本层数一致
             num_quantizers = nqs[0]
             if any(nq != num_quantizers for nq in nqs):
                 raise ValueError(
@@ -2723,6 +3014,11 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         input_values: torch.Tensor,
         input_lengths: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """编码前预处理：波形长度补齐到下采样率的倍数；多声道交错压成单流。
+
+        多声道交错：[B, C, T] -> [B, 1, C*T]（同一时刻的各声道采样点相邻排列），
+        此时等效帧率变为原来的 C 倍。
+        """
         if input_values.dim() != 3:
             raise ValueError(f"Expected `input_values` with shape `(B, C, T)`, got {tuple(input_values.shape)}.")
         if input_values.shape[1] != self.number_channels:
@@ -2744,6 +3040,7 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         output_values: torch.Tensor,
         output_lengths: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """解码后处理：_flatten_channels_for_codec 的逆操作，恢复多声道布局。"""
         if self.number_channels == 1 or not self.enable_channel_interleave:
             return output_values.float(), output_lengths
 
@@ -2763,6 +3060,7 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         hidden_chunks: list[list[torch.Tensor]],
         lengths: torch.Tensor,
     ) -> torch.Tensor | None:
+        """把分块编码得到的隐藏状态片段按样本拼接并 padding 成 [B, D, T_max]。"""
         hidden_dim = None
         for chunks_i in hidden_chunks:
             if chunks_i:
@@ -2789,6 +3087,7 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         input_lengths: torch.Tensor | None = None,
         n_quantizers: int | None = None,
     ) -> MossAudioTokenizerEncoderOutput:
+        """单次编码：波形 -> 编码器 -> 量化器 -> 码本 token。"""
         if input_values.dim() == 1:
             input_values = input_values.view(1, 1, -1)
         elif input_values.dim() == 2:
@@ -2827,6 +3126,7 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         codes: torch.Tensor,
         codes_lengths: torch.Tensor | None = None,
     ) -> MossAudioTokenizerDecoderOutput:
+        """单次解码：码本 token -> 量化器求和 -> 解码器 -> 波形。"""
         _, batch_size, time = codes.shape
         device = codes.device
         if codes_lengths is None:
@@ -2850,6 +3150,12 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         num_quantizers: int | None = None,
         chunk_duration: float | None = None,
     ) -> MossAudioTokenizerEncoderOutput:
+        """批量编码波形为码本 token。
+
+        chunk_duration 为 None 时整段一次编码；否则按 chunk_duration 秒
+        分块流式编码（内部维护 causal Transformer 的 KV cache，
+        内存占用与音频时长无关）。
+        """
         input_values, input_lengths = self._prepare_waveform_batch(wav_list)
         batch_size = len(wav_list)
         device = input_values.device
@@ -2873,6 +3179,7 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         codes_chunks: list[list[torch.Tensor]] = [[] for _ in range(batch_size)]
         hidden_chunks: list[list[torch.Tensor]] = [[] for _ in range(batch_size)]
 
+        # 流式分块编码主循环：每步只对尚未编码完的样本推进
         with self.streaming(batch_size=batch_size):
             while bool((cursors < input_lengths).any().item()):
                 remaining = input_lengths - cursors
@@ -2910,6 +3217,7 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
                             hidden_chunks[i].append(result.encoder_hidden_states[i, :, :codes_length_i].clone())
                     cursors[i] += step_length
 
+        # 把各样本的分块结果拼接并 padding 成 batch
         num_quantizers_used = self._infer_num_quantizers(codes_chunks, num_quantizers)
         empty_codes = torch.empty((num_quantizers_used, 0), device=device, dtype=torch.long)
         codes_list = [torch.cat(chunks_i, dim=-1) if chunks_i else empty_codes.clone() for chunks_i in codes_chunks]
@@ -2933,6 +3241,15 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         reset_stream: bool = False,
         use_cuda_graph: bool = False,
     ) -> MossAudioTokenizerDecoderOutput:
+        """批量解码码本 token 为波形。
+
+        三种用法：
+        - 普通模式（streaming=False, chunk_duration=None）：整段一次解码；
+        - 分块模式（chunk_duration 指定）：按秒分块流式解码，内部 KV cache；
+        - 连续批处理流式（streaming=True）：跨多次调用保持解码会话，
+          每次调用喂入新增的码本帧；``finalize_indices`` 用于标记本次
+          调用后结束的样本（释放其槽位）。
+        """
         if len(codes_list) == 0:
             raise ValueError("`codes_list` must contain at least one code tensor.")
 
@@ -2959,6 +3276,7 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
             return self._decode_frame(audio_codes, audio_codes_lengths)
 
         if streaming:
+            # 连续批处理：复用或创建解码会话，把本次输入作为一个 step
             assert streaming_max_batch_size is not None
             existing_session = self._batch_decode_streaming_session
             reusing_streaming_session = existing_session is not None and not existing_session._closed
@@ -2982,6 +3300,7 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
                 raise
 
             try:
+                # 新增的样本注册为新的解码请求
                 if batch_size > pre_call_batch_size:
                     self._append_batch_decode_streaming_requests(session=session, target_batch_size=batch_size)
 
@@ -3001,6 +3320,7 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
             self._batch_decode_streaming_batch_size = len(session.active_request_ids)
             return MossAudioTokenizerDecoderOutput(audio=audio, audio_lengths=audio_lengths)
 
+        # ---- 分块流式解码（一次性输入，内部分块）----
         assert chunk_duration is not None
         if chunk_duration <= 0:
             raise ValueError("`chunk_duration` must be > 0 when provided.")
@@ -3053,6 +3373,7 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
                         wav_chunks[i].append(result.audio[i, :, :audio_length_i].clone())
                     cursors[i] += step_frames
 
+        # 把各样本的分块波形拼接并 padding 成 batch
         wav_dtype = self._infer_waveform_dtype(wav_chunks)
         audio_lengths = torch.tensor(
             [sum(chunk.shape[-1] for chunk in chunks_i) for chunks_i in wav_chunks],
@@ -3099,11 +3420,13 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
             `MossAudioTokenizerEncoderOutput` or tuple containing audio codes and lengths.
         """
         return_dict = return_dict if return_dict is not None else self.config.return_dict
+        # 先把各种形状的输入统一成波形列表，再交给 batch_encode
         wav_list: list[torch.Tensor]
         if input_values.dim() == 1:
             wav_list = [input_values]
         elif input_values.dim() == 2:
             if self.number_channels == 1:
+                # (B, T)：按 padding_mask 或全长裁出每条波形
                 lengths = (
                     padding_mask.sum(dim=-1).long()
                     if padding_mask is not None and padding_mask.dim() == 2
@@ -3111,6 +3434,7 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
                 )
                 wav_list = [input_values[i, : int(lengths[i].item())] for i in range(input_values.shape[0])]
             else:
+                # (C, T)：多声道单条波形
                 length = (
                     int(padding_mask.sum().item())
                     if padding_mask is not None and padding_mask.dim() == 1
@@ -3118,6 +3442,7 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
                 )
                 wav_list = [input_values[:, :length]]
         elif input_values.dim() == 3:
+            # (B, C, T)
             if input_values.shape[1] != self.number_channels:
                 raise ValueError(
                     f"Expected `input_values.shape[1] == {self.number_channels}`, got {input_values.shape[1]}."
@@ -3176,6 +3501,7 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         return_dict = return_dict if return_dict is not None else self.config.return_dict
         self._raise_if_plain_decode_conflicts_with_active_session()
 
+        # 把各种形状的输入统一成码本列表，再交给 batch_decode
         if audio_codes.dim() == 2:
             codes_list = [audio_codes[:num_quantizers] if num_quantizers is not None else audio_codes]
         elif audio_codes.dim() == 3:

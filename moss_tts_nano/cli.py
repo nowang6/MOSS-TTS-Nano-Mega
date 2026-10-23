@@ -1,3 +1,11 @@
+"""MOSS-TTS-Nano 命令行入口。
+
+提供两个子命令：
+- ``generate``：合成单条音频，内部转发给 infer.py（PyTorch）或 infer_onnx.py（ONNX）；
+- ``serve``：启动 FastAPI 演示服务，内部转发给 app.py（PyTorch）或 app_onnx.py（ONNX）。
+
+CLI 本身只做参数解析与转发，真正的推理逻辑在仓库根目录的对应脚本里。
+"""
 from __future__ import annotations
 
 import argparse
@@ -17,6 +25,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    # ---- generate 子命令：单条音频合成 ----
     generate_parser = subparsers.add_parser(
         "generate",
         help="Generate audio by forwarding to infer.py.",
@@ -51,6 +60,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=str(DEFAULT_OUTPUT_DIR / "moss_tts_nano_output.wav"),
         help="Output wav path.",
     )
+    # 待合成文本：--text 与 --text-file 二选一
     text_group = generate_parser.add_mutually_exclusive_group(required=True)
     text_group.add_argument("--text", help="Text to synthesize.")
     text_group.add_argument("--text-file", help="Path to a UTF-8 text file to synthesize.")
@@ -134,6 +144,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     generate_parser.set_defaults(handler=_run_generate)
 
+    # ---- serve 子命令：启动 FastAPI 演示服务 ----
     serve_parser = subparsers.add_parser(
         "serve",
         help="Launch the FastAPI demo by forwarding to app.py.",
@@ -205,6 +216,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _validate_onnx_generate_args(args: argparse.Namespace) -> None:
+    """ONNX 后端的能力边界检查：不支持的参数组合尽早报错。"""
     if args.mode != "voice_clone":
         raise SystemExit("The ONNX backend currently supports only `--mode voice_clone`.")
     if args.prompt_text:
@@ -216,6 +228,7 @@ def _validate_onnx_generate_args(args: argparse.Namespace) -> None:
 
 
 def _run_generate_pytorch(args: argparse.Namespace) -> int:
+    """把 CLI 参数翻译成 infer.py 的命令行参数并调用其 main()。"""
     import infer as infer_module
 
     infer_argv: list[str] = [
@@ -269,6 +282,7 @@ def _run_generate_pytorch(args: argparse.Namespace) -> int:
 
 
 def _run_generate_onnx(args: argparse.Namespace) -> int:
+    """把 CLI 参数翻译成 infer_onnx.py 的命令行参数并调用其 main()。"""
     import infer_onnx as infer_onnx_module
 
     _validate_onnx_generate_args(args)
@@ -333,6 +347,7 @@ def _run_generate(args: argparse.Namespace) -> int:
 
 
 def _validate_onnx_serve_args(args: argparse.Namespace) -> None:
+    """ONNX 后端的能力边界检查（serve 版）。"""
     if args.device not in {"auto", "cpu"}:
         raise SystemExit("For the ONNX backend, use `--execution-provider cuda` instead of `--device cuda`.")
     if args.dtype not in {"auto", "float32"}:
@@ -342,6 +357,7 @@ def _validate_onnx_serve_args(args: argparse.Namespace) -> None:
 
 
 def _run_serve_pytorch(args: argparse.Namespace) -> int:
+    """把 CLI 参数翻译成 app.py 的命令行参数并调用其 main()。"""
     import app as app_module
 
     app_argv = [
@@ -369,6 +385,7 @@ def _run_serve_pytorch(args: argparse.Namespace) -> int:
 
 
 def _run_serve_onnx(args: argparse.Namespace) -> int:
+    """把 CLI 参数翻译成 app_onnx.py 的命令行参数并调用其 main()。"""
     import app_onnx as app_onnx_module
 
     _validate_onnx_serve_args(args)

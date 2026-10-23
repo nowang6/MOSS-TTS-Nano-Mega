@@ -1,4 +1,16 @@
 # coding=utf-8
+"""MOSS-TTS-Nano 主模型：文本 -> 离散音频 token 的因果语言模型。
+
+模型结构（global + local 两级 Transformer）：
+- 全局 Transformer（GPT-2 架构）：沿时间轴逐帧建模。每一帧的输入 embedding
+  = 文本 token embedding + 各音频码本通道 embedding 之和；
+- 局部 Transformer（层数更少的小 GPT-2）：在每一帧内部，先预测一个文本侧
+  控制 token（继续生成 / 结束），再逐码本通道自回归地预测音频 token。
+
+输入张量 ``input_ids`` 的形状为 ``[batch, seq, n_vq + 1]``：
+- 第 0 通道：文本 token id；
+- 第 1 ~ n_vq 通道：各音频码本的 token id（无音频处填 audio_pad_token_id）。
+"""
 from __future__ import annotations
 
 import json
@@ -29,14 +41,16 @@ from .prompting import (
 )
 from .tokenization_moss_tts_nano import MossTTSNanoSentencePieceTokenizer
 
-try:  # preferred: installed package, with model code kept apart from the weights
+try:  # 优先：已安装 moss_tts_nano 包，模型代码与权重分离
     from moss_tts_nano.models.audio_tokenizer import MossAudioTokenizerModel
-except ImportError:  # checkpoint loaded via trust_remote_code without the package installed
+except ImportError:  # 通过 trust_remote_code 加载 checkpoint、包未安装时的兜底
     MossAudioTokenizerModel = None
 
 
 @dataclass
 class MossTTSNanoOutput(ModelOutput):
+    """前向输出：全局 Transformer 最后一层的隐藏状态及可选的缓存/中间结果。"""
+
     global_hidden_states: Optional[torch.FloatTensor] = None
     past_key_values: Optional[tuple[tuple[torch.Tensor, torch.Tensor], ...]] = None
     hidden_states: Optional[tuple[torch.FloatTensor, ...]] = None
@@ -45,22 +59,30 @@ class MossTTSNanoOutput(ModelOutput):
 
 @dataclass
 class MossTTSNanoGenerationOutput(ModelOutput):
+    """生成输出：音频 token 序列 [batch, frames, n_vq] 及对应的 prompt。"""
+
     audio_token_ids: torch.LongTensor
     prompt_input_ids: Optional[torch.LongTensor] = None
 
 
 MOSS_AUDIO_TOKENIZER_NANO_TYPE = "moss-audio-tokenizer-nano"
 DEFAULT_MOSS_AUDIO_TOKENIZER_PRETRAINED_NAME_OR_PATH = "OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano"
+# 语音克隆时，单个文本分片允许的最大 token 数
 DEFAULT_VOICE_CLONE_MAX_TEXT_TOKENS = 50
+# 语音克隆分片批处理时，每条样本预估的显存占用上限（GB）
 DEFAULT_VOICE_CLONE_MAX_MEMORY_PER_SAMPLE_GB = 1.0
+# 分片拼接时，短句/长句之后插入的停顿时长（秒）
 DEFAULT_VOICE_CLONE_INTER_CHUNK_PAUSE_SHORT_SECONDS = 0.40
 DEFAULT_VOICE_CLONE_INTER_CHUNK_PAUSE_LONG_SECONDS = 0.24
+# 句子结束标点 / 子句切分标点 / 右闭合标点（中英文）
 _SENTENCE_END_PUNCTUATION = frozenset(".!?。！？；;")
 _CLAUSE_SPLIT_PUNCTUATION = frozenset(",，、；;：:")
 _CLOSING_PUNCTUATION = frozenset("\"'”’)]}）】》」』")
 
 
 class MossTTSNanoPreTrainedModel(PreTrainedModel):
+    """HF 集成基类：声明配置类与权重切分/注意力后端支持。"""
+
     config_class = MossTTSNanoConfig
     base_model_prefix = "transformer"
     supports_gradient_checkpointing = False
@@ -70,6 +92,9 @@ class MossTTSNanoPreTrainedModel(PreTrainedModel):
 
 
 class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
+    """MOSS-TTS-Nano 因果语言模型（仅推理，不支持训练前向）。"""
+
+    # 局部 Transformer 不自带词 embedding（输入是全局隐藏状态），加载时忽略该键
     _keys_to_ignore_on_load_unexpected = [r"local_transformer\.wte\.weight"]
 
     def __init__(self, config: MossTTSNanoConfig) -> None:
@@ -77,6 +102,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         config.gpt2_config.pad_token_id = config.pad_token_id
         config.gpt2_config._attn_implementation = config.attn_implementation
 
+        # 全局 Transformer：沿时间轴建模
         self.transformer = MossTTSNanoGPT2Model(
             config.gpt2_config,
             attn_implementation=config.attn_implementation,
@@ -84,13 +110,16 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         hidden_size = config.gpt2_config.hidden_size
         init_std = config.gpt2_config.initializer_range
 
+        # 每个音频码本通道一个 embedding 表
         self.audio_embeddings = nn.ModuleList(
             [
                 nn.Embedding(int(config.audio_codebook_sizes[index]), hidden_size)
                 for index in range(config.n_vq)
             ]
         )
+        # 文本输出头（与词 embedding 权重共享）
         self.text_lm_head = nn.Linear(hidden_size, config.gpt2_config.vocab_size, bias=False)
+        # 每个音频码本通道一个输出头（与对应 embedding 权重共享）
         self.audio_lm_heads = nn.ModuleList(
             [
                 nn.Linear(hidden_size, int(config.audio_codebook_sizes[index]), bias=False)
@@ -98,6 +127,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
             ]
         )
 
+        # 局部 Transformer：序列长度固定为 n_vq + 1（1 个文本控制 token + n_vq 个音频通道）
         local_gpt2_config = config.gpt2_config.to_dict()
         local_gpt2_config["n_layer"] = int(config.local_transformer_layers)
         local_gpt2_config["n_positions"] = config.n_vq + 1
@@ -106,6 +136,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
             GPT2Config(**local_gpt2_config),
             attn_implementation=str(config.local_transformer_attn_implementation),
         )
+        # 局部 Transformer 的输入是 embedding 向量而非 token id，wte 用 Identity 占位
         self.local_transformer.wte = nn.Identity()
 
         for module in list(self.audio_embeddings) + [self.text_lm_head] + list(self.audio_lm_heads):
@@ -117,6 +148,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
 
     @property
     def all_tied_weights_keys(self) -> dict[str, str]:
+        """权重共享表：输出头 -> 对应输入 embedding。"""
         tied_weights = {"text_lm_head.weight": "transformer.wte.weight"}
         tied_weights.update(
             {
@@ -127,6 +159,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         return tied_weights
 
     def tie_weights(self, *args, **kwargs) -> None:
+        """执行权重共享：文本/音频输出头分别复用词 embedding 与音频 embedding。"""
         del args, kwargs
         self.text_lm_head.weight = self.transformer.wte.weight
         for embedding, lm_head in zip(self.audio_embeddings, self.audio_lm_heads):
@@ -140,6 +173,11 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         self.tie_weights()
 
     def _build_inputs_embeds(self, input_ids: torch.LongTensor) -> torch.FloatTensor:
+        """把 [batch, seq, n_vq+1] 的多通道 token id 融合成 embedding。
+
+        每一帧的 embedding = 文本 embedding + 各音频通道 embedding 之和；
+        音频通道为 pad 的位置不计入。
+        """
         if input_ids.ndim != 3 or input_ids.shape[-1] != self.config.n_vq + 1:
             raise ValueError(
                 f"Expected input_ids shape [batch, seq, {self.config.n_vq + 1}], got {tuple(input_ids.shape)}"
@@ -151,6 +189,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         for channel_index, embedding in enumerate(self.audio_embeddings):
             channel_ids = input_ids[..., channel_index + 1]
             valid_mask = channel_ids.ne(self.config.audio_pad_token_id)
+            # 非 pad 但超出码本词表范围的 id 属于数据错误，直接报错
             invalid_mask = valid_mask & ((channel_ids < 0) | (channel_ids >= embedding.num_embeddings))
             if invalid_mask.any():
                 invalid_token_ids = channel_ids[invalid_mask]
@@ -161,6 +200,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
                     f"codebook_size={embedding.num_embeddings} "
                     f"audio_pad_token_id={self.config.audio_pad_token_id}"
                 )
+            # pad 位置先替换成 0 查表，再用掩码清零，避免越界
             safe_ids = channel_ids.masked_fill(~valid_mask, 0)
             audio_embeds = embedding(safe_ids)
             audio_embeds = audio_embeds * valid_mask.unsqueeze(-1)
@@ -222,11 +262,16 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
             attentions=outputs.attentions,
         )
 
+    # ------------------------------------------------------------------
+    # 输入构造：把文本 token / 音频 token 排成 [seq, n_vq+1] 的行
+    # ------------------------------------------------------------------
+
     def _build_text_rows(
         self,
         token_ids: list[int],
         device: torch.device,
     ) -> torch.LongTensor:
+        """构造纯文本行：第 0 通道为文本 token，其余音频通道全部填 pad。"""
         rows = torch.full(
             (len(token_ids), self.config.n_vq + 1),
             self.config.audio_pad_token_id,
@@ -238,33 +283,42 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         return rows
 
     def _encode_text(self, tokenizer, text: str) -> list[int]:
+        """文本编码（不添加特殊 token），兼容不支持该参数的 tokenizer。"""
         try:
             return list(tokenizer.encode(text, add_special_tokens=False))
         except TypeError:
             return list(tokenizer.encode(text))
 
+    # ------------------------------------------------------------------
+    # 文本预处理与分片（语音克隆长文本时使用）
+    # ------------------------------------------------------------------
+
     @staticmethod
     def _contains_cjk(text: str) -> bool:
+        """判断文本是否包含中日韩字符。"""
         return any(
-            "\u4e00" <= ch <= "\u9fff"
-            or "\u3400" <= ch <= "\u4dbf"
-            or "\u3040" <= ch <= "\u30ff"
-            or "\uac00" <= ch <= "\ud7af"
+            "一" <= ch <= "鿿"
+            or "㐀" <= ch <= "䶿"
+            or "぀" <= ch <= "ヿ"
+            or "가" <= ch <= "힯"
             for ch in str(text)
         )
 
     @staticmethod
     def _prepare_text_for_sentence_chunking(text: str) -> str:
+        """分片前的文本规范化：去空白、补结尾标点、英文首字母大写等。"""
         normalized_text = str(text).strip()
         if normalized_text == "":
             raise ValueError("Text prompt cannot be empty.")
 
+        # 换行折叠为空格，压缩连续空格
         normalized_text = normalized_text.replace("\n", " ").replace("\r", " ")
         while "  " in normalized_text:
             normalized_text = normalized_text.replace("  ", " ")
 
         contains_cjk = MossTTSNanoForCausalLM._contains_cjk(normalized_text)
         if contains_cjk:
+            # 中文文本保证以句末标点结尾
             if normalized_text[-1] not in _SENTENCE_END_PUNCTUATION:
                 normalized_text = normalized_text + "。"
             return normalized_text
@@ -273,12 +327,14 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
             normalized_text = normalized_text[0].upper() + normalized_text[1:]
         if normalized_text[-1].isalnum():
             normalized_text = normalized_text + "."
+        # 英文短文本前补空格，缓解模型对超短输入的不稳定
         if len(normalized_text.split()) < 5:
             normalized_text = " " * 8 + normalized_text
         return normalized_text
 
     @staticmethod
     def _split_text_by_punctuation(text: str, punctuation: set[str] | frozenset[str]) -> list[str]:
+        """按标点切分文本，标点保留在句尾，右闭合标点（引号/括号）跟随标点。"""
         sentences: list[str] = []
         current_chars: list[str] = []
         text = str(text)
@@ -287,6 +343,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
             char = text[index]
             current_chars.append(char)
             if char in punctuation:
+                # 把紧跟在标点后的右闭合标点（如 ”）】）也并入当前句
                 lookahead = index + 1
                 while lookahead < len(text) and text[lookahead] in _CLOSING_PUNCTUATION:
                     current_chars.append(text[lookahead])
@@ -295,12 +352,14 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
                 if sentence:
                     sentences.append(sentence)
                 current_chars = []
+                # 跳过句间空白
                 while lookahead < len(text) and text[lookahead].isspace():
                     lookahead += 1
                 index = lookahead
                 continue
             index += 1
 
+        # 收尾：最后一段没有标点结尾的文本
         tail = "".join(current_chars).strip()
         if tail:
             sentences.append(tail)
@@ -315,6 +374,11 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         text: str,
         max_tokens: int,
     ) -> list[str]:
+        """把超长文本按 token 预算硬切分，优先在标点/空格处断开。
+
+        先二分找到不超过预算的最长前缀，再在前缀尾部 ~25 字符内
+        寻找最近的标点/空格作为切分点。
+        """
         remaining_text = str(text).strip()
         if remaining_text == "":
             return []
@@ -326,6 +390,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
                 pieces.append(remaining_text)
                 break
 
+            # 二分查找：满足 token 预算的最长前缀长度
             low = 1
             high = len(remaining_text)
             best_prefix_length = 1
@@ -341,6 +406,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
                 else:
                     high = middle - 1
 
+            # 在前缀末尾附近找标点/空格，尽量不在词中间切开
             cut_index = best_prefix_length
             prefix = remaining_text[:best_prefix_length]
             preferred_index = -1
@@ -361,6 +427,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
 
     @staticmethod
     def _join_sentence_parts(left: str, right: str) -> str:
+        """拼接两个句子片段：含 CJK 时直接相连，否则用空格分隔。"""
         if not left:
             return right
         if not right:
@@ -375,6 +442,11 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         text: str,
         max_tokens: int,
     ) -> list[str]:
+        """把长文本切成若干不超过 max_tokens 的分片。
+
+        切分优先级：句子 > 子句 > 按 token 预算硬切；
+        之后再贪心地把相邻小片段合并，减少分片数量。
+        """
         if int(max_tokens) <= 0:
             return [str(text)]
 
@@ -383,6 +455,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         if not sentence_candidates:
             sentence_candidates = [prepared_text.strip()]
 
+        # 第一遍：把每个句子拆成满足 token 预算的 (token 数, 文本) 片段
         sentence_slices: list[tuple[int, str]] = []
         for sentence_text in sentence_candidates:
             normalized_sentence = sentence_text.strip()
@@ -393,6 +466,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
                 sentence_slices.append((sentence_token_count, normalized_sentence))
                 continue
 
+            # 句子超长：降级按子句（逗号等）切
             clause_candidates = self._split_text_by_punctuation(
                 normalized_sentence,
                 punctuation=_CLAUSE_SPLIT_PUNCTUATION,
@@ -408,6 +482,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
                 if clause_token_count <= int(max_tokens):
                     sentence_slices.append((clause_token_count, normalized_clause))
                     continue
+                # 子句仍超长：按 token 预算硬切
                 for piece in self._split_text_by_token_budget(
                     text_tokenizer=text_tokenizer,
                     text=normalized_clause,
@@ -419,6 +494,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
                             (self._count_text_tokens(text_tokenizer, normalized_piece), normalized_piece)
                         )
 
+        # 第二遍：贪心合并相邻片段，直到再加一个就会超预算
         chunks: list[str] = []
         current_chunk = ""
         current_chunk_token_count = 0
@@ -439,8 +515,13 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
             chunks.append(current_chunk.strip())
         return chunks or [prepared_text.strip()]
 
+    # ------------------------------------------------------------------
+    # 语音克隆的分片拼接与停顿估计
+    # ------------------------------------------------------------------
+
     @staticmethod
     def _estimate_voice_clone_inter_chunk_pause_seconds(text_chunk: str) -> float:
+        """根据分片长短估计其后的停顿时长：短句停顿更长，长句停顿更短。"""
         return (
             DEFAULT_VOICE_CLONE_INTER_CHUNK_PAUSE_SHORT_SECONDS
             if len(str(text_chunk).strip().split()) <= 4
@@ -453,6 +534,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         text_chunks: list[str],
         sample_rate: int,
     ) -> torch.FloatTensor:
+        """把多个分片波形拼接起来，相邻分片之间插入估计的静音停顿。"""
         if not waveform_chunks:
             return torch.zeros((1, 0), dtype=torch.float32)
         if len(waveform_chunks) != len(text_chunks):
@@ -472,12 +554,21 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
                 segments.append(silence)
         return torch.cat(segments, dim=-1)
 
+    # ------------------------------------------------------------------
+    # 推理参数解析
+    # ------------------------------------------------------------------
+
     @staticmethod
     def _resolve_inference_mode(
         mode: str,
         has_prompt_text: bool,
         has_prompt_audio: bool,
     ) -> str:
+        """校验并规范化推理模式。
+
+        - ``continuation``（续写）：只给目标文本，或 prompt_text + prompt_audio 同时给；
+        - ``voice_clone``（语音克隆）：只给 prompt_audio，不接受 prompt_text。
+        """
         normalized_mode = str(mode or "continuation").strip().lower() or "continuation"
         if normalized_mode not in {"continuation", "voice_clone"}:
             raise ValueError(f"Unsupported inference mode {mode!r}.")
@@ -493,6 +584,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         return normalized_mode
 
     def _resolve_inference_nq(self, nq: Optional[int] = None) -> int:
+        """解析实际使用的码本通道数，默认用全部 n_vq 通道。"""
         if nq is None:
             return int(self.config.n_vq)
         resolved_nq = int(nq)
@@ -505,6 +597,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         audio_token_ids: torch.LongTensor,
         nq: int,
     ) -> torch.LongTensor:
+        """把超出前 nq 个通道的音频 token 置为 pad（推理只使用前 nq 层码本）。"""
         tensor = torch.as_tensor(audio_token_ids, dtype=torch.long)
         if tensor.shape[-1] != self.config.n_vq:
             raise ValueError(
@@ -521,6 +614,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         slot_token_id: int,
         device: torch.device,
     ) -> torch.LongTensor:
+        """构造音频行：第 0 通道为槽位 token，其余通道为参考音频的码本 token。"""
         rows = torch.full(
             (int(prompt_audio_codes.shape[0]), self.config.n_vq + 1),
             self.config.audio_pad_token_id,
@@ -541,6 +635,17 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         prompt_audio_codes: Optional[torch.LongTensor] = None,
         device: Optional[Union[str, torch.device]] = None,
     ) -> tuple[torch.LongTensor, torch.BoolTensor]:
+        """构造推理输入：把 prompt 文本与参考音频 token 排成 [1, seq, n_vq+1]。
+
+        voice_clone 布局：
+            [文本行: user 前缀 + audio_start]
+            [音频行: 用户槽位 token + 参考音频 codes]
+            [文本行: audio_end + 固定字段 + 目标文本 + assistant 前缀 + audio_start]
+        continuation 布局：
+            [文本行: 完整 prompt（含参考文本转写 + 目标文本）]
+            [文本行: audio_start]
+            [音频行: 助手槽位 token + 参考音频 codes]（可选）
+        """
         resolved_device = self._resolve_device(device)
         resolved_mode = self._resolve_inference_mode(
             mode=mode,
@@ -572,6 +677,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
             attention_mask = torch.ones(input_ids.shape[:2], dtype=torch.bool, device=resolved_device)
             return input_ids, attention_mask
 
+        # continuation：参考文本转写与目标文本拼接后一起进 prompt
         effective_text = text if prompt_text is None else prompt_text + text
         prompt_token_ids = build_prompt_token_ids(
             tokenizer=text_tokenizer,
@@ -600,6 +706,10 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         attention_mask_batches: list[torch.BoolTensor],
         device: torch.device,
     ) -> tuple[torch.LongTensor, torch.BoolTensor]:
+        """把多条长度不一的输入左 padding 对齐，拼成一个 batch。
+
+        左 padding 保证所有样本的生成起点（序列末尾）对齐。
+        """
         if not input_id_batches:
             raise ValueError("input_id_batches must not be empty.")
         if len(input_id_batches) != len(attention_mask_batches):
@@ -609,6 +719,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         max_seq_len = max(int(batch.shape[1]) for batch in input_id_batches)
         row_width = self.config.n_vq + 1
 
+        # padding 位置的文本通道填文本 pad，音频通道填音频 pad
         padded_input_ids = torch.full(
             (batch_size, max_seq_len, row_width),
             self.config.audio_pad_token_id,
@@ -632,6 +743,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         audio_token_ids: torch.LongTensor,
         effective_nq: int,
     ) -> torch.LongTensor:
+        """裁掉生成结果末尾的无效帧（整行都是 pad 的帧）。"""
         tensor = self._mask_unused_audio_channels(audio_token_ids, nq=effective_nq)
         if tensor.ndim != 2:
             raise ValueError(f"Expected a 2D audio token tensor, got {tuple(tensor.shape)}")
@@ -641,6 +753,10 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         last_valid_index = int(torch.nonzero(valid_rows, as_tuple=False)[-1].item()) + 1
         return tensor[:last_valid_index]
 
+    # ------------------------------------------------------------------
+    # 语音克隆批处理大小推断（按显存自动估算）
+    # ------------------------------------------------------------------
+
     def _resolve_voice_clone_chunk_batch_size(
         self,
         *,
@@ -648,6 +764,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         chunk_count: int,
         max_memory_per_sample_gb: float,
     ) -> int:
+        """按剩余显存估算一次能并行生成多少个文本分片（仅 CUDA 生效）。"""
         if chunk_count <= 1 or max_memory_per_sample_gb <= 0 or resolved_device.type != "cuda":
             return 1
         if not hasattr(torch.cuda, "mem_get_info"):
@@ -659,6 +776,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         bytes_per_sample = int(float(max_memory_per_sample_gb) * (1024**3))
         if bytes_per_sample <= 0:
             return 1
+        # 留 10% 显存余量，避免 OOM
         usable_free_bytes = max(0, int(free_bytes * 0.9))
         batch_size = max(1, usable_free_bytes // bytes_per_sample)
         resolved_batch_size = max(1, min(int(chunk_count), int(batch_size)))
@@ -674,6 +792,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
 
     @staticmethod
     def _resolve_requested_batch_size_limit(requested_batch_size: Optional[int]) -> Optional[int]:
+        """规范化用户指定的批大小上限：None/<=0 表示不限制。"""
         if requested_batch_size is None:
             return None
         resolved_batch_size = int(requested_batch_size)
@@ -691,6 +810,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         requested_codec_max_batch_size: Optional[int] = None,
         realtime_streaming: bool = False,
     ) -> tuple[int, int]:
+        """综合显存估算与用户上限，得出 (TTS 生成批大小, codec 解码批大小)。"""
         effective_tts_batch_size = self._resolve_voice_clone_chunk_batch_size(
             resolved_device=resolved_device,
             chunk_count=chunk_count,
@@ -706,6 +826,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
 
         effective_tts_batch_size = max(1, min(int(chunk_count), int(effective_tts_batch_size)))
 
+        # 流式场景下解码与生成同批推进；非流式默认逐条解码
         if realtime_streaming:
             effective_codec_batch_size = effective_tts_batch_size
         elif requested_codec_limit is None:
@@ -714,6 +835,10 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
             effective_codec_batch_size = max(1, min(int(requested_codec_limit), int(effective_tts_batch_size)))
 
         return int(effective_tts_batch_size), int(effective_codec_batch_size)
+
+    # ------------------------------------------------------------------
+    # 生成 -> 解码 的封装（含数值稳定性兜底）
+    # ------------------------------------------------------------------
 
     def _generate_audio_token_ids_with_fallback(
         self,
@@ -733,6 +858,10 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         use_kv_cache: bool,
         resolved_device: torch.device,
     ) -> torch.LongTensor:
+        """调用 generate 生成音频 token；遇到数值不稳定错误时降级重试一次。
+
+        降级策略：切换到 fp32 + sdpa/eager 注意力（见 _apply_inference_stability_fallback）。
+        """
         try:
             generation = self.generate(
                 input_ids=prompt_input_ids,
@@ -781,6 +910,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         effective_nq: int,
         resolved_device: torch.device,
     ) -> tuple[torch.FloatTensor, int]:
+        """把音频 token 解码成波形，返回 (波形 [C, T], 采样率)。"""
         decoded = self._call_audio_decode(
             audio_tokenizer=audio_tokenizer,
             audio_token_ids=audio_token_ids.to(resolved_device),
@@ -798,6 +928,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         effective_nq: int,
         resolved_device: torch.device,
     ) -> tuple[list[torch.FloatTensor], int]:
+        """批量解码多条音频 token 序列；批量解码失败时逐条重试。"""
         if not audio_token_id_batches:
             return [], target_sample_rate
 
@@ -856,6 +987,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         device: torch.device,
         audio_token_ids: torch.LongTensor,
     ) -> torch.LongTensor:
+        """把一个生成帧包装成 [batch, 1, n_vq+1] 的输入行（下一帧的模型输入）。"""
         row = torch.full(
             (batch_size, 1, self.config.n_vq + 1),
             self.config.audio_pad_token_id,
@@ -866,12 +998,17 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         row[:, :, 1:] = audio_token_ids.unsqueeze(1)
         return row
 
+    # ------------------------------------------------------------------
+    # 流式解码的节拍控制：根据音频领先优势动态调整每次解码的帧数
+    # ------------------------------------------------------------------
+
     @staticmethod
     def _compute_stream_lead_seconds(
         emitted_samples_total: int,
         sample_rate: int,
         first_audio_emitted_at: Optional[float],
     ) -> float:
+        """计算「已产出音频时长 - 实际经过时长」，即流式产出的领先秒数。"""
         if first_audio_emitted_at is None or sample_rate <= 0:
             return 0.0
         elapsed_seconds = max(0.0, time.monotonic() - first_audio_emitted_at)
@@ -885,6 +1022,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         sample_rate: int,
         first_audio_emitted_at: Optional[float],
     ) -> int:
+        """根据领先优势决定单次流式解码的帧数预算：领先越多，单次解码越多帧。"""
         lead_seconds = MossTTSNanoForCausalLM._compute_stream_lead_seconds(
             emitted_samples_total=emitted_samples_total,
             sample_rate=sample_rate,
@@ -898,6 +1036,10 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
             return 4
         return 8
 
+    # ------------------------------------------------------------------
+    # 采样：温度 / top-k / top-p / 重复惩罚
+    # ------------------------------------------------------------------
+
     def _sample_next_token(
         self,
         logits: torch.FloatTensor,
@@ -908,6 +1050,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         previous_token_ids: Optional[torch.LongTensor] = None,
         repetition_penalty: float = 1.0,
     ) -> torch.LongTensor:
+        """从 logits 采样下一个 token；do_sample=False 时贪心取 argmax。"""
         scores = self._apply_repetition_penalty(
             logits=logits,
             previous_token_ids=previous_token_ids,
@@ -920,15 +1063,18 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
 
         scores = scores / temperature
         if top_k is not None and top_k > 0:
+            # top-k：只保留分数最高的 k 个候选
             top_k = min(top_k, scores.shape[-1])
             threshold = torch.topk(scores, top_k, dim=-1).values[..., -1, None]
             scores = scores.masked_fill(scores < threshold, float("-inf"))
 
         if top_p is not None and 0.0 < top_p < 1.0:
+            # top-p（核采样）：按累计概率截断候选集
             sorted_scores, sorted_indices = torch.sort(scores, descending=True, dim=-1)
             sorted_probs = torch.softmax(sorted_scores, dim=-1)
             sorted_cumsum = torch.cumsum(sorted_probs, dim=-1)
             sorted_remove = sorted_cumsum > top_p
+            # 整体右移一位：保证累计概率首次超过 top_p 的那个 token 仍被保留
             sorted_remove[..., 1:] = sorted_remove[..., :-1].clone()
             sorted_remove[..., 0] = False
             sorted_scores = sorted_scores.masked_fill(sorted_remove, float("-inf"))
@@ -940,6 +1086,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
 
     @staticmethod
     def _ensure_finite_generation_logits(logits: torch.FloatTensor, name: str) -> None:
+        """检查 logits 是否含有 NaN/Inf；有则抛出带定位信息的错误。"""
         if torch.isfinite(logits).all():
             return
         finite_mask = torch.isfinite(logits)
@@ -958,6 +1105,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         previous_token_ids: Optional[torch.LongTensor],
         repetition_penalty: float,
     ) -> torch.FloatTensor:
+        """重复惩罚：已出现过的 token，正分除以 penalty、负分乘以 penalty。"""
         if repetition_penalty <= 0:
             raise ValueError("repetition_penalty must be positive")
         if repetition_penalty == 1.0 or previous_token_ids is None:
@@ -994,6 +1142,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
     ) -> torch.LongTensor:
+        """预测文本侧控制 token：只在「继续生成音频」与「结束」两个候选中采样。"""
         candidate_ids = torch.tensor(
             [
                 self.config.audio_assistant_slot_token_id,
@@ -1013,10 +1162,16 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         return candidate_ids[sampled_indices]
 
     def _resolve_device(self, device: Optional[Union[str, torch.device]] = None) -> torch.device:
+        """解析运行设备；未指定时跟随模型参数所在设备。"""
         return torch.device(device) if device is not None else next(self.parameters()).device
+
+    # ------------------------------------------------------------------
+    # 文本分词器的定位与加载
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _looks_like_hf_tokenizer_dir(candidate_path: Path) -> bool:
+        """判断目录是否像 HF 分词器目录（含 tokenizer.model / tokenizer.json 等）。"""
         if not candidate_path.is_dir():
             return False
         if (candidate_path / "tokenizer.model").is_file():
@@ -1033,6 +1188,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
 
     @staticmethod
     def _looks_like_hf_repo_id(candidate: str) -> bool:
+        """判断字符串是否像 HF 仓库 id（形如 "org/name"），而非本地路径。"""
         stripped = candidate.strip()
         if not stripped:
             return False
@@ -1045,12 +1201,18 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
 
     @staticmethod
     def _existing_local_path(raw_path: Union[str, Path]) -> Optional[Path]:
+        """展开 ~ 并解析为绝对路径；不存在时返回 None。"""
         candidate_path = Path(raw_path).expanduser()
         if not candidate_path.exists():
             return None
         return candidate_path.resolve()
 
     def _resolve_text_tokenizer_path(self, raw_path: Union[str, Path]) -> str:
+        """把用户给出的分词器路径解析成可加载的来源。
+
+        支持：本地 .model 文件、HF 分词器目录、实验目录（内含 hf_tokenizer/
+        sentencepiece/ 或 final_summary.json）、HF 仓库 id。
+        """
         local_candidate_path = self._existing_local_path(raw_path)
         if local_candidate_path is None:
             raw_source = str(raw_path).strip()
@@ -1072,6 +1234,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
             sentencepiece_model = candidate_path / "sentencepiece" / "mossttsnano_spm_bpe.model"
             if sentencepiece_model.is_file():
                 return str(sentencepiece_model)
+            # 训练实验目录：从 final_summary.json 里读最近一次导出的分词器目录
             final_summary_path = candidate_path / "final_summary.json"
             if final_summary_path.is_file():
                 final_summary = json.loads(final_summary_path.read_text(encoding="utf-8"))
@@ -1085,6 +1248,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         )
 
     def _load_resolved_text_tokenizer(self, resolved_path: str):
+        """按解析后的来源实际加载分词器（本地文件优先离线加载）。"""
         local_path = self._existing_local_path(resolved_path)
         load_source = str(local_path) if local_path is not None else str(resolved_path)
         if local_path is not None and local_path.is_file() and local_path.suffix == ".model":
@@ -1098,6 +1262,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
                 **load_kwargs,
             )
         except Exception:
+            # 兜底：目录下直接找 tokenizer.model
             if local_path is not None:
                 model_path = local_path / "tokenizer.model"
                 if model_path.is_file():
@@ -1105,6 +1270,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
             raise
 
     def _resolve_default_text_tokenizer_path(self) -> str:
+        """未显式指定分词器路径时，从 checkpoint 所在位置推断。"""
         candidates: list[Union[str, Path]] = []
 
         raw_name_or_path = getattr(self.config, "_name_or_path", None)
@@ -1129,6 +1295,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
             checked.add(resolved_candidate)
             return resolved_candidate
 
+        # 都解析失败时，原样返回第一个候选，让后续加载报错信息更直观
         for candidate in candidates:
             raw_candidate = str(candidate).strip()
             if raw_candidate:
@@ -1139,6 +1306,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         )
 
     def _load_text_tokenizer(self, text_tokenizer=None, text_tokenizer_path: Optional[str] = None):
+        """加载文本分词器（带缓存）；已传入实例时直接返回。"""
         if text_tokenizer is not None:
             return text_tokenizer
 
@@ -1160,8 +1328,13 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         self._cached_text_tokenizer_path = normalized_path
         return tokenizer
 
+    # ------------------------------------------------------------------
+    # 音频编解码器（audio tokenizer）的类型解析与加载
+    # ------------------------------------------------------------------
+
     @staticmethod
     def _normalize_audio_tokenizer_type(audio_tokenizer_type: Optional[str]) -> Optional[str]:
+        """规范化音频编解码器类型名；开源包只支持 moss-audio-tokenizer-nano。"""
         if audio_tokenizer_type is None:
             return None
         normalized = str(audio_tokenizer_type).strip().lower()
@@ -1175,6 +1348,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         )
 
     def _resolve_audio_tokenizer_type(self, audio_tokenizer_type: Optional[str]) -> str:
+        """解析音频编解码器类型：显式参数 > 配置 > 默认值。"""
         explicit_type = self._normalize_audio_tokenizer_type(audio_tokenizer_type)
         if explicit_type is not None:
             return explicit_type
@@ -1183,6 +1357,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
 
     @staticmethod
     def _set_decoder_attention_implementation(decoder, attn_implementation: str) -> None:
+        """把一个 GPT-2 主干（含每一层 block）的注意力实现统一切换。"""
         decoder.attn_implementation = str(attn_implementation)
         if getattr(decoder, "config", None) is not None:
             decoder.config._attn_implementation = str(attn_implementation)
@@ -1194,6 +1369,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         attn_implementation: str,
         local_attn_implementation: Optional[str] = None,
     ) -> None:
+        """同时切换全局 / 局部 Transformer 的注意力实现。"""
         resolved_global = str(attn_implementation)
         resolved_local = resolved_global if local_attn_implementation is None else str(local_attn_implementation)
         self.config.attn_implementation = resolved_global
@@ -1204,10 +1380,12 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
 
     @staticmethod
     def _select_fallback_attention_implementation(device: torch.device) -> str:
+        """数值不稳定时的降级注意力实现：CUDA 用 sdpa，其余用 eager。"""
         return "sdpa" if device.type == "cuda" else "eager"
 
     @staticmethod
     def _is_generation_stability_error(exc: Exception) -> bool:
+        """判断异常是否属于生成过程中的数值不稳定（可降级重试）。"""
         message = str(exc)
         return any(
             marker in message
@@ -1220,6 +1398,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         )
 
     def _apply_inference_stability_fallback(self, device: torch.device) -> None:
+        """应用稳定性降级：模型转 fp32，并切换到更稳的注意力实现。"""
         fallback_attn = self._select_fallback_attention_implementation(device)
         if next(self.parameters()).dtype != torch.float32:
             self.to(device=device, dtype=torch.float32)
@@ -1236,6 +1415,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         audio_tokenizer_pretrained_name_or_path: Optional[str] = None,
         device: Optional[Union[str, torch.device]] = None,
     ):
+        """加载音频编解码器（带缓存）；已传入实例时直接返回。"""
         if audio_tokenizer is not None:
             return audio_tokenizer
 
@@ -1250,6 +1430,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
             or getattr(self.config, "audio_tokenizer_pretrained_name_or_path", None)
             or DEFAULT_MOSS_AUDIO_TOKENIZER_PRETRAINED_NAME_OR_PATH
         )
+        # 本地路径存在则离线加载，否则按 HF 仓库 id 处理
         candidate_path = Path(str(resolved_pretrained_name_or_path)).expanduser()
         if candidate_path.exists():
             load_source = str(candidate_path.resolve())
@@ -1269,7 +1450,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         else:
             if MossAudioTokenizerModel is not None:
                 tokenizer = MossAudioTokenizerModel.from_pretrained(load_source, **load_kwargs)
-            else:  # dynamic-module checkpoint: audio tokenizer code must come from its own repo
+            else:  # 动态模块加载的 checkpoint：音频编解码器代码来自其自身仓库
                 tokenizer = AutoModel.from_pretrained(load_source, trust_remote_code=True, **load_kwargs)
             if hasattr(tokenizer, "eval"):
                 tokenizer.eval()
@@ -1279,8 +1460,13 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         resolved_device = self._resolve_device(device)
         return tokenizer.to(resolved_device) if hasattr(tokenizer, "to") else tokenizer
 
+    # ------------------------------------------------------------------
+    # 音频编解码器输出的解析（兼容多种返回格式）
+    # ------------------------------------------------------------------
+
     @staticmethod
     def _extract_tensor_candidate(output: Any) -> Any:
+        """从编解码器的各种可能返回类型中取出码本张量。"""
         if torch.is_tensor(output) or isinstance(output, np.ndarray):
             return output
         for attr_name in ("audio_codes", "audio_token_ids", "codes", "tokens", "input_ids"):
@@ -1294,6 +1480,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
             if len(output) == 1:
                 return next(iter(output.values()))
         if isinstance(output, (list, tuple)) and output:
+            # (张量, 长度) 形式的二元组，取第一个元素
             if len(output) == 2 and isinstance(output[1], (int, float)):
                 return output[0]
             return MossTTSNanoForCausalLM._extract_tensor_candidate(output[0])
@@ -1301,6 +1488,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
 
     @staticmethod
     def _extract_audio_code_length(output: Any) -> Optional[int]:
+        """从编解码器输出中提取有效码本长度（去除 padding 用）。"""
         for attr_name in ("audio_codes_lengths", "audio_token_ids_lengths", "codes_lengths", "lengths"):
             candidate = getattr(output, attr_name, None)
             if candidate is not None:
@@ -1324,16 +1512,23 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         return None
 
     def _normalize_audio_codes(self, audio_codes: Any) -> torch.LongTensor:
+        """把编解码器的输出统一成 [frames, n_vq] 的二维 long 张量。
+
+        兼容 (n_vq, T)、(1, n_vq, T)、(B, n_vq, T) 等多种布局，
+        多余通道截断、按有效长度裁剪。
+        """
         code_length = self._extract_audio_code_length(audio_codes)
         tensor = torch.as_tensor(self._extract_tensor_candidate(audio_codes))
         if tensor.ndim == 1:
             tensor = tensor.unsqueeze(-1)
         if tensor.ndim == 3:
             if tensor.shape[1] == 1 and tensor.shape[0] >= self.config.n_vq:
+                # (n_vq, 1, T) -> (T, n_vq)
                 tensor = tensor[: self.config.n_vq, 0, :].transpose(0, 1)
             elif tensor.shape[0] == 1:
                 tensor = tensor[0]
             elif tensor.shape[1] == self.config.n_vq:
+                # (B, n_vq, T) -> 取第 0 条后转置
                 tensor = tensor.transpose(1, 2)[0]
             elif tensor.shape[-1] == self.config.n_vq:
                 tensor = tensor[0]
@@ -1343,6 +1538,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         if tensor.ndim != 2:
             raise ValueError(f"Expected audio codes with 2 dims after normalization, got {tuple(tensor.shape)}")
         if tensor.shape[-1] != self.config.n_vq and tensor.shape[0] == self.config.n_vq:
+            # (n_vq, T) -> (T, n_vq)
             tensor = tensor.transpose(0, 1)
         elif tensor.shape[-1] != self.config.n_vq and tensor.shape[0] > self.config.n_vq:
             tensor = tensor[: self.config.n_vq].transpose(0, 1)
@@ -1361,10 +1557,12 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         decode_output: Any,
         fallback_sample_rate: int,
     ) -> tuple[torch.FloatTensor, int]:
+        """从解码输出中提取 (波形 [C, T], 采样率)，兼容多种返回格式。"""
         sample_rate = fallback_sample_rate
         waveform = decode_output
         waveform_length = None
 
+        # 先按对象属性查找
         for key in ("sample_rate", "sampling_rate"):
             value = getattr(decode_output, key, None)
             if value is not None:
@@ -1381,8 +1579,9 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
                 lengths = torch.as_tensor(value).reshape(-1)
                 if lengths.numel() > 0:
                     waveform_length = int(lengths[0].item())
-                    break
+                break
 
+        # 再按 dict / 元组形式查找
         if isinstance(decode_output, dict):
             for key in ("sample_rate", "sampling_rate"):
                 if key in decode_output:
@@ -1405,10 +1604,12 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
             else:
                 waveform = decode_output[0]
 
+        # 统一形状为 [channels, samples]
         waveform_tensor = torch.as_tensor(waveform, dtype=torch.float32)
         if waveform_tensor.ndim == 3 and waveform_tensor.shape[0] == 1:
             waveform_tensor = waveform_tensor[0]
         if waveform_tensor.ndim == 2 and waveform_tensor.shape[0] > waveform_tensor.shape[1]:
+            # (T, C) -> (C, T)
             waveform_tensor = waveform_tensor.transpose(0, 1)
         if waveform_tensor.ndim == 1:
             waveform_tensor = waveform_tensor.unsqueeze(0)
@@ -1424,6 +1625,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         waveform: torch.FloatTensor,
         sample_rate: int,
     ) -> Any:
+        """调用音频编解码器的 batch_encode，把波形编码为码本 token。"""
         del sample_rate
         batch_encode_fn = getattr(audio_tokenizer, "batch_encode", None)
         if batch_encode_fn is None:
@@ -1447,6 +1649,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         sample_rate: int,
         nq: Optional[int] = None,
     ) -> Any:
+        """调用音频编解码器的 batch_decode，把码本 token 解码为波形。"""
         del sample_rate
         batch_decode_fn = getattr(audio_tokenizer, "batch_decode", None)
         if batch_decode_fn is None:
@@ -1463,6 +1666,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         fallback_sample_rate: int,
         batch_size: int,
     ) -> tuple[list[torch.FloatTensor], int]:
+        """从批量解码输出中提取每条样本的波形列表与采样率。"""
         sample_rate = fallback_sample_rate
         audio = decode_output
         audio_lengths = None
@@ -1497,6 +1701,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
                     audio_lengths = decode_output[key]
                     break
 
+        # 统一形状为 [batch, channels, samples]
         audio_tensor = torch.as_tensor(audio, dtype=torch.float32)
         if audio_tensor.ndim == 2:
             audio_tensor = audio_tensor.unsqueeze(0)
@@ -1507,6 +1712,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
                 f"Expected decoded batch size {batch_size}, got audio tensor shape {tuple(audio_tensor.shape)}"
             )
 
+        # 每条样本的有效长度；缺失时视为整段有效
         if audio_lengths is None:
             lengths_tensor = torch.full(
                 (batch_size,),
@@ -1525,8 +1731,13 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
             waveform_rows.append(audio_tensor[row_index, :, :row_length].detach().cpu())
         return waveform_rows, sample_rate
 
+    # ------------------------------------------------------------------
+    # 音频编解码器的元信息探测
+    # ------------------------------------------------------------------
+
     @staticmethod
     def _resolve_audio_tokenizer_downsample_rate(audio_tokenizer) -> int:
+        """探测编解码器的下采样率（波形采样点数 / 码本帧数）。"""
         for holder in (audio_tokenizer, getattr(audio_tokenizer, "config", None)):
             if holder is None:
                 continue
@@ -1541,6 +1752,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         raise ValueError("audio_tokenizer.downsample_rate is required for prompt-audio decoding.")
 
     def _resolve_audio_tokenizer_sample_rate(self, audio_tokenizer) -> int:
+        """探测编解码器的工作采样率。"""
         for holder in (audio_tokenizer, getattr(audio_tokenizer, "config", None)):
             if holder is None:
                 continue
@@ -1552,6 +1764,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
 
     @staticmethod
     def _resolve_audio_tokenizer_channels(audio_tokenizer) -> int:
+        """探测编解码器输出的声道数。"""
         for holder in (audio_tokenizer, getattr(audio_tokenizer, "config", None)):
             if holder is None:
                 continue
@@ -1563,6 +1776,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
 
     @staticmethod
     def _audio_tokenizer_inference_context(audio_tokenizer, device: Union[str, torch.device]):
+        """编解码器推理上下文；当前为空操作，预留钩子。"""
         del audio_tokenizer, device
         return nullcontext()
 
@@ -1571,15 +1785,18 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         audio_token_ids: torch.LongTensor,
         nq: Optional[int] = None,
     ) -> torch.LongTensor:
+        """把生成的音频 token 整理成编解码器要求的 [nq, T] 布局。"""
         effective_nq = self._resolve_inference_nq(nq)
         tensor = torch.as_tensor(audio_token_ids, dtype=torch.long)
         if tensor.ndim == 2:
             if tensor.shape[-1] == self.config.n_vq and tensor.shape[0] != self.config.n_vq:
+                # (T, n_vq) -> 截取前 nq 通道后转置为 (nq, T)
                 return tensor[:, :effective_nq].transpose(0, 1).contiguous()
             if tensor.shape[0] == self.config.n_vq:
                 return tensor[:effective_nq].contiguous()
         elif tensor.ndim == 3:
             if tensor.shape[-1] == self.config.n_vq:
+                # (B, T, n_vq) -> (nq, B, T)
                 return tensor[..., :effective_nq].permute(2, 0, 1).contiguous()
             if tensor.shape[0] == self.config.n_vq:
                 return tensor[:effective_nq].contiguous()
@@ -1593,6 +1810,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         target_sample_rate: int,
         target_channels: int,
     ) -> tuple[torch.FloatTensor, int]:
+        """加载参考音频，并重采样 / 转换声道到目标格式。"""
         waveform, sample_rate = torchaudio.load(str(reference_audio_path))
         waveform = waveform.to(torch.float32)
         if sample_rate != target_sample_rate:
@@ -1602,15 +1820,26 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         if current_channels == target_channels:
             return waveform, sample_rate
         if current_channels == 1 and target_channels > 1:
+            # 单声道 -> 多声道：复制
             return waveform.repeat(target_channels, 1), sample_rate
         if current_channels > 1 and target_channels == 1:
+            # 多声道 -> 单声道：取平均
             return waveform.mean(dim=0, keepdim=True), sample_rate
         raise ValueError(f"Unsupported reference audio channel conversion: {current_channels} -> {target_channels}")
+
+    # ------------------------------------------------------------------
+    # 局部 Transformer 前向
+    # ------------------------------------------------------------------
 
     def _decode_local_last_hidden_state(
         self,
         local_inputs_embeds: torch.FloatTensor,
     ) -> torch.FloatTensor:
+        """跑一次局部 Transformer，取最后一个位置的隐藏状态。
+
+        局部序列固定为「全局隐藏状态, 已预测的各通道 embedding...」，
+        长度 <= n_vq + 1，因此不需要 KV cache。
+        """
         local_attention_mask = torch.ones(
             local_inputs_embeds.shape[:2],
             dtype=torch.bool,
@@ -1630,6 +1859,10 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         )
         return local_outputs.last_hidden_state[:, -1, :]
 
+    # ------------------------------------------------------------------
+    # 自回归生成
+    # ------------------------------------------------------------------
+
     def _iter_generation_events(
         self,
         input_ids: torch.LongTensor,
@@ -1647,6 +1880,18 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         use_kv_cache: bool = True,
         return_dict_in_generate: bool = True,
     ) -> Iterator[dict[str, Any]]:
+        """逐帧生成音频 token 的事件流。
+
+        每帧的流程：
+        1. 全局 Transformer 前向（带 KV cache），取最后位置隐藏状态；
+        2. 局部 Transformer 先预测文本侧控制 token：
+           - audio_assistant_slot_token_id：继续生成本帧音频；
+           - audio_end_token_id：该样本生成结束；
+        3. 局部 Transformer 逐码本通道自回归预测本帧的音频 token；
+        4. 产出 ``frame`` 事件，并把本帧拼回输入，进入下一帧。
+
+        全部样本结束或达到 max_new_frames 后，产出 ``final`` 事件。
+        """
         if input_ids.ndim == 2:
             input_ids = input_ids.unsqueeze(0)
         if input_ids.ndim != 3:
@@ -1660,6 +1905,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         batch_size = input_ids.shape[0]
         current_input_ids = input_ids
         current_attention_mask = attention_mask.to(device=input_ids.device)
+        # KV cache 模式下只喂最新一帧；否则每次喂完整序列
         current_model_input_ids = current_input_ids
         generated_frames = []
         finished = torch.zeros(batch_size, dtype=torch.bool, device=input_ids.device)
@@ -1667,7 +1913,10 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         local_dtype = self.local_transformer.ln_f.weight.dtype
 
         for step_index in range(max_new_frames):
+            # 历史音频帧，用于重复惩罚
             generated_audio_history = torch.stack(generated_frames, dim=1) if generated_frames else None
+
+            # ---- 第 1 步：全局 Transformer ----
             global_inputs_embeds = self._build_inputs_embeds(current_model_input_ids)
             global_outputs = self.transformer(
                 input_ids=None,
@@ -1684,6 +1933,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
             )
             global_hidden_states = global_outputs.last_hidden_state[:, -1, :].to(dtype=local_dtype)
 
+            # ---- 第 2 步：局部 Transformer 预测文本侧控制 token ----
             local_inputs_embeds = global_hidden_states.unsqueeze(1)
             local_hidden_states = self._decode_local_last_hidden_state(local_inputs_embeds)
             text_logits = self.text_lm_head(local_hidden_states)
@@ -1695,11 +1945,13 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
                 top_k=text_top_k,
                 top_p=text_top_p,
             )
+            # 已结束的样本不再继续；预测到结束 token 的样本标记为 finished
             should_continue = next_text_tokens.eq(self.config.audio_assistant_slot_token_id) & ~finished
             finished = finished | next_text_tokens.eq(self.config.audio_end_token_id)
             if not should_continue.any():
                 break
 
+            # ---- 第 3 步：逐码本通道自回归预测本帧音频 token ----
             next_frame_tokens = []
             current_local_input = self.transformer.wte(next_text_tokens).to(dtype=local_dtype)
             for channel_index in range(effective_nq):
@@ -1721,6 +1973,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
                 next_frame_tokens.append(channel_token)
                 current_local_input = self.audio_embeddings[channel_index](channel_token).to(dtype=local_dtype)
 
+            # 未使用的通道（nq 之后的）填 pad
             next_frame_prefix = torch.stack(next_frame_tokens, dim=-1)
             if effective_nq < self.config.n_vq:
                 next_frame = torch.full(
@@ -1732,15 +1985,18 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
                 next_frame[:, :effective_nq] = next_frame_prefix
             else:
                 next_frame = next_frame_prefix
+            # 已结束样本的本帧全部填 pad
             padded_next_frame = next_frame.masked_fill(~should_continue.unsqueeze(-1), self.config.audio_pad_token_id)
             generated_frames.append(padded_next_frame)
 
+            # ---- 第 4 步：把本帧拼回输入，准备下一帧 ----
             next_row = self._build_generation_row(
                 batch_size=batch_size,
                 device=input_ids.device,
                 audio_token_ids=padded_next_frame,
             )
             if (~should_continue).any():
+                # 已结束样本：文本通道填 pad，不再占语义槽位
                 next_row[~should_continue, 0, 0] = self.config.pad_token_id
                 next_row[~should_continue, 0, 1:] = self.config.audio_pad_token_id
 
@@ -1791,6 +2047,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         use_kv_cache: bool = True,
         return_dict_in_generate: bool = True,
     ):
+        """一次性生成全部音频 token，返回最终结果（非流式）。"""
         final_output: Any = None
         for event in self._iter_generation_events(
             input_ids=input_ids,
@@ -1833,6 +2090,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         use_kv_cache: bool = True,
         return_dict_in_generate: bool = True,
     ) -> Iterator[dict[str, Any]]:
+        """流式生成：每生成一帧就产出一个 ``frame`` 事件，最后产出 ``final``。"""
         yield from self._iter_generation_events(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -1849,6 +2107,10 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
             use_kv_cache=use_kv_cache,
             return_dict_in_generate=return_dict_in_generate,
         )
+
+    # ------------------------------------------------------------------
+    # 端到端推理入口
+    # ------------------------------------------------------------------
 
     @torch.no_grad()
     def inference_stream(
@@ -1881,6 +2143,12 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         tts_max_batch_size: int = 0,
         codec_max_batch_size: int = 0,
     ) -> Iterator[dict[str, Any]]:
+        """流式端到端推理：文本 -> 音频 token -> 边生成边解码出波形片段。
+
+        产出两类事件：
+        - ``{"type": "audio", ...}``：一段解码好的波形（含分片间静音停顿）；
+        - ``{"type": "result", ...}``：最终结果汇总，并把完整音频写入 output_audio_path。
+        """
         resolved_device = self._resolve_device(device)
         effective_nq = self._resolve_inference_nq(nq)
         if next(self.parameters()).device != resolved_device:
@@ -1914,6 +2182,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
                 reference_audio_path,
             )
 
+        # 参考音频：加载 -> 编码为码本 token -> 屏蔽未使用通道
         prompt_audio_codes = None
         if effective_prompt_audio_path is not None:
             waveform, sample_rate = self._load_reference_audio(
@@ -1931,6 +2200,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
                 nq=effective_nq,
             ).to(resolved_device)
 
+        # 语音克隆 + 长文本：先按句子分片；只有单片时保留原文本
         if resolved_mode == "voice_clone":
             split_voice_clone_text_chunks = self._split_text_into_best_sentences(
                 text_tokenizer=text_tokenizer,
@@ -1984,6 +2254,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
                     device=resolved_device,
                 )
 
+                # 每条样本的流式状态：待解码帧队列、已解码波形队列、生成/停顿标记
                 row_states = [
                     {
                         "pending_decode_frames": [],
@@ -1996,6 +2267,8 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
                 batch_emit_index = 0
                 codec_stream_started = False
 
+                # continuation 模式下先把参考音频送入流式解码器预热，
+                # 让 codec 的流式状态与 prompt 对齐
                 if resolved_mode == "continuation" and prompt_audio_codes is not None:
                     prompt_decode_codes = self._prepare_audio_codes_for_decode(prompt_audio_codes, nq=effective_nq)
                     _ = audio_tokenizer.batch_decode(
@@ -2008,6 +2281,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
                     codec_stream_started = True
 
                 def _emit_ready_segments() -> Iterator[dict[str, Any]]:
+                    """把已解码、且排在队首的波形片段按顺序产出（含分片间静音）。"""
                     nonlocal batch_emit_index, emitted_samples_total, first_audio_emitted_at
                     active_sample_rate = decoded_sample_rate or target_sample_rate
                     while batch_emit_index < len(batch_chunks):
@@ -2036,9 +2310,11 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
                             }
                             continue
 
+                        # 队首样本还没生成完：必须等它，保证输出顺序
                         if not state["generation_complete"]:
                             break
 
+                        # 当前样本已生成完：在 voice_clone 多分片场景下，先补一段静音停顿
                         if (
                             resolved_mode == "voice_clone"
                             and len(voice_clone_text_chunks) > 1
@@ -2075,6 +2351,11 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
                         batch_emit_index += 1
 
                 def _maybe_decode_pending(force: bool) -> Iterator[dict[str, Any]]:
+                    """把积压的生成帧送去流式解码。
+
+                    非强制模式下根据领先优势决定要不要解码、解多少帧，
+                    避免解码太快（浪费算力）或太慢（播放断流）。
+                    """
                     nonlocal codec_stream_started, decoded_sample_rate
                     pending_counts = [len(state["pending_decode_frames"]) for state in row_states]
                     total_pending = sum(pending_counts)
@@ -2097,12 +2378,16 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
                     if not force:
                         should_decode = False
                         if first_audio_emitted_at is None and head_pending > 0:
+                            # 首包音频优先，尽快产出
                             should_decode = True
                         elif head_pending > 0 and lead_seconds < 0.45:
+                            # 领先优势太小：队首有待解码帧就立刻解
                             should_decode = True
                         elif max(pending_counts) >= decode_budget:
+                            # 积压帧数达到预算：凑够一批再解
                             should_decode = True
                         elif lead_seconds < 0.0 and total_pending > 0:
+                            # 已经落后于播放进度：有什么解什么
                             should_decode = True
                         if not should_decode:
                             return
@@ -2186,6 +2471,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
                     for state in row_states:
                         state["generation_complete"] = True
 
+                    # 收尾：强制解完剩余帧，并把队列里的波形全部产出
                     yield from _maybe_decode_pending(force=True)
                     yield from _emit_ready_segments()
 
@@ -2201,6 +2487,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
                     if codec_stream_started and callable(streaming_reset_fn):
                         streaming_reset_fn()
 
+            # 汇总全部音频 token 与波形
             if generated_audio_token_chunks:
                 audio_token_ids = torch.cat(generated_audio_token_chunks, dim=0)
             else:
@@ -2262,6 +2549,11 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
         tts_max_batch_size: int = 0,
         codec_max_batch_size: int = 0,
     ) -> dict[str, Any]:
+        """非流式端到端推理：生成全部音频 token 后一次性解码、写盘。
+
+        流程：加载分词器/编解码器 -> 编码参考音频 -> （语音克隆时）文本分片
+        -> 分批生成音频 token -> 解码为波形 -> 拼接分片并写入 wav 文件。
+        """
         resolved_device = self._resolve_device(device)
         effective_nq = self._resolve_inference_nq(nq)
         if next(self.parameters()).device != resolved_device:
@@ -2295,6 +2587,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
                 reference_audio_path,
             )
 
+        # 参考音频：加载 -> 编码为码本 token -> 屏蔽未使用通道
         prompt_audio_codes = None
         if effective_prompt_audio_path is not None:
             waveform, sample_rate = self._load_reference_audio(
@@ -2312,6 +2605,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
                 nq=effective_nq,
             ).to(resolved_device)
 
+        # 语音克隆 + 长文本：先按句子分片；只有单片时保留原文本
         if resolved_mode == "voice_clone":
             split_voice_clone_text_chunks = self._split_text_into_best_sentences(
                 text_tokenizer=text_tokenizer,
@@ -2377,6 +2671,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
                 resolved_device=resolved_device,
             )
 
+            # 逐样本裁剪掉末尾的无效帧
             batch_audio_token_chunks: list[torch.LongTensor] = []
             for sample_index in range(len(batch_chunks)):
                 audio_token_ids = self._trim_generated_audio_token_ids(
@@ -2386,6 +2681,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
                 generated_audio_token_chunks.append(audio_token_ids)
                 batch_audio_token_chunks.append(audio_token_ids)
 
+            # 多分片的语音克隆：按 codec 批大小分批解码为波形
             if resolved_mode == "voice_clone" and len(voice_clone_text_chunks) > 1:
                 for codec_batch_start in range(0, len(batch_audio_token_chunks), voice_clone_codec_batch_size):
                     codec_audio_token_batches = batch_audio_token_chunks[
@@ -2412,6 +2708,7 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
             audio_token_ids = torch.empty((0, self.config.n_vq), dtype=torch.long, device=resolved_device)
 
         if resolved_mode == "voice_clone" and len(voice_clone_text_chunks) > 1:
+            # 多分片：拼接各分片波形，分片间插入静音停顿
             waveform = (
                 self._concat_voice_clone_waveform_chunks(
                     waveform_chunks=decoded_waveform_chunks,
@@ -2422,9 +2719,12 @@ class MossTTSNanoForCausalLM(MossTTSNanoPreTrainedModel):
                 else torch.zeros((target_channels, 0), dtype=torch.float32)
             )
         else:
+            # 单分片 / continuation：一次性解码
             decode_audio_token_ids = audio_token_ids
             prompt_waveform_prefix_samples = 0
             if resolved_mode == "continuation" and prompt_audio_codes is not None:
+                # continuation 模式下把参考音频的 token 拼在前面一起解码
+                # （保证声学连贯），解码后再把参考音频对应的波形前缀裁掉
                 decode_audio_token_ids = torch.cat([prompt_audio_codes, audio_token_ids], dim=0)
                 prompt_waveform_prefix_samples = (
                     int(prompt_audio_codes.shape[0]) * self._resolve_audio_tokenizer_downsample_rate(audio_tokenizer)

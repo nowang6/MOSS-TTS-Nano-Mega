@@ -8,11 +8,18 @@ import sentencepiece as spm
 from transformers import PreTrainedTokenizer
 
 
+# 分词器权重文件名：HF 目录结构下 SentencePiece 模型固定叫 tokenizer.model
 VOCAB_FILES_NAMES = {"vocab_file": "tokenizer.model"}
 
 
 class MossTTSNanoSentencePieceTokenizer(PreTrainedTokenizer):
+    """MOSS-TTS-Nano 使用的 SentencePiece（BPE）分词器。
+
+    基于 ``sentencepiece`` 的慢速（slow）实现，负责文本 <-> token id 的转换。
+    """
+
     vocab_files_names = VOCAB_FILES_NAMES
+    # 下游 batch 编码时会用到的字段名
     model_input_names = ["input_ids", "attention_mask"]
 
     def __init__(
@@ -27,6 +34,7 @@ class MossTTSNanoSentencePieceTokenizer(PreTrainedTokenizer):
     ) -> None:
         self.vocab_file = str(vocab_file)
         self.sp_model_kwargs = {} if sp_model_kwargs is None else dict(sp_model_kwargs)
+        # 加载 SentencePiece 模型文件
         self.sp_model = spm.SentencePieceProcessor(**self.sp_model_kwargs)
         self.sp_model.Load(self.vocab_file)
         super().__init__(
@@ -39,14 +47,17 @@ class MossTTSNanoSentencePieceTokenizer(PreTrainedTokenizer):
 
     @property
     def vocab_size(self) -> int:
+        """词表大小（SentencePiece piece 数量）。"""
         return int(self.sp_model.get_piece_size())
 
     def get_vocab(self) -> dict[str, int]:
+        """返回完整词表：piece -> id，包含训练后追加的特殊 token。"""
         vocab = {self.sp_model.id_to_piece(i): i for i in range(self.vocab_size)}
         vocab.update(self.added_tokens_encoder)
         return vocab
 
     def _tokenize(self, text: str) -> list[str]:
+        """把文本切分为 piece 字符串列表。"""
         return list(self.sp_model.encode(text, out_type=str))
 
     def _convert_token_to_id(self, token: str) -> int:
@@ -57,13 +68,16 @@ class MossTTSNanoSentencePieceTokenizer(PreTrainedTokenizer):
         return str(self.sp_model.id_to_piece(int(index)))
 
     def convert_tokens_to_string(self, tokens: list[str]) -> str:
+        """把 piece 列表还原为字符串（交给 SentencePiece 做 detokenize）。"""
         return str(self.sp_model.decode(tokens))
 
     def save_vocabulary(self, save_directory: str, filename_prefix: str | None = None) -> tuple[str]:
+        """把 tokenizer.model 复制到目标目录，返回保存路径。"""
         save_dir = Path(save_directory)
         save_dir.mkdir(parents=True, exist_ok=True)
         out_name = "tokenizer.model" if filename_prefix is None else f"{filename_prefix}-tokenizer.model"
         out_path = save_dir / out_name
+        # 源文件与目标文件相同（原地保存）时跳过拷贝
         if Path(self.vocab_file).resolve() != out_path.resolve():
             shutil.copyfile(self.vocab_file, out_path)
         return (str(out_path),)
@@ -73,6 +87,7 @@ class MossTTSNanoSentencePieceTokenizer(PreTrainedTokenizer):
         token_ids_0: list[int],
         token_ids_1: list[int] | None = None,
     ) -> list[int]:
+        """拼接序列。本模型不自动添加 BOS/EOS，原样返回。"""
         if token_ids_1 is None:
             return list(token_ids_0)
         return list(token_ids_0) + list(token_ids_1)
@@ -83,6 +98,7 @@ class MossTTSNanoSentencePieceTokenizer(PreTrainedTokenizer):
         token_ids_1: list[int] | None = None,
         already_has_special_tokens: bool = False,
     ) -> list[int]:
+        """标记特殊 token 位置。本模型无特殊 token，全返回 0。"""
         if already_has_special_tokens:
             return super().get_special_tokens_mask(
                 token_ids_0=token_ids_0,
@@ -98,6 +114,7 @@ class MossTTSNanoSentencePieceTokenizer(PreTrainedTokenizer):
         token_ids_0: list[int],
         token_ids_1: list[int] | None = None,
     ) -> list[int]:
+        """构造 segment id。本模型不区分句子对，全返回 0。"""
         if token_ids_1 is None:
             return [0] * len(token_ids_0)
         return [0] * (len(token_ids_0) + len(token_ids_1))
